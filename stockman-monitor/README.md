@@ -151,7 +151,7 @@ Tasks: :web:jsBrowserDevelopmentRun
 ./scripts/restart-local.sh
 ```
 
-脚本会先关闭旧的 `screen` 会话和已经占用 `8080`、`8081` 的旧进程，然后后台启动服务端和前端开发服务器。
+脚本会先关闭旧的 `screen` 会话和已经占用 `8080`、`8081` 的旧进程，然后后台启动服务端，并把前端构建产物用本地静态服务器托管到 `8081`。
 
 等价命令如下，便于在没有脚本权限时复制执行：
 
@@ -162,12 +162,16 @@ pids=$({ lsof -ti tcp:8080; lsof -ti tcp:8081; } 2>/dev/null | sort -u); \
 if [ -n "$pids" ]; then kill $pids; sleep 2; fi; \
 mkdir -p run-logs; \
 ./gradlew --no-daemon :server:installDist > run-logs/server-build.log 2>&1; \
+./gradlew --no-daemon :web:jsBrowserDevelopmentWebpack > run-logs/web-build.log 2>&1; \
+rm -rf run-logs/web-dist; mkdir -p run-logs/web-dist; \
+cp web/build/processedResources/js/main/index.html run-logs/web-dist/; \
+cp web/build/kotlin-webpack/js/developmentExecutable/stockman-monitor.js run-logs/web-dist/; \
 screen -dmS stockman-server bash -lc 'cd /Users/haoshuaihui/AndroidProject/MyLearn/StockMan/stockman-monitor && server/build/install/server/bin/server > run-logs/server.log 2>&1'; \
-screen -dmS stockman-web bash -lc 'cd /Users/haoshuaihui/AndroidProject/MyLearn/StockMan/stockman-monitor && ./gradlew --no-daemon -Dkotlin.daemon.jvm.options=-Xmx2g :web:jsBrowserDevelopmentRun > run-logs/web.log 2>&1'; \
+screen -dmS stockman-web bash -lc 'cd /Users/haoshuaihui/AndroidProject/MyLearn/StockMan/stockman-monitor/run-logs/web-dist && python3 -m http.server 8081 > /Users/haoshuaihui/AndroidProject/MyLearn/StockMan/stockman-monitor/run-logs/web.log 2>&1'; \
 echo "server: http://localhost:8080"; \
 echo "db:     http://localhost:8080/db"; \
 echo "web:    http://localhost:8081"; \
-echo "logs:   run-logs/server-build.log run-logs/server.log run-logs/web.log"
+echo "logs:   run-logs/server-build.log run-logs/web-build.log run-logs/server.log run-logs/web.log"
 ```
 
 查看启动日志：

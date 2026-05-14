@@ -14,6 +14,7 @@ collect_pids() {
     pgrep -f "$ROOT_DIR/.+server/build/install/server/bin/server"
     pgrep -f "$ROOT_DIR/.+:web:jsBrowserDevelopmentRun"
     pgrep -f "$ROOT_DIR/.+webpack"
+    pgrep -f "python3 -m http\\.server 8081"
   } 2>/dev/null | sort -u | grep -v "^$$$" || true
 }
 
@@ -78,8 +79,13 @@ wait_for_port() {
 stop_existing
 
 ./gradlew --no-daemon :server:installDist > run-logs/server-build.log 2>&1
+./gradlew --no-daemon :web:jsBrowserDevelopmentWebpack > run-logs/web-build.log 2>&1
+rm -rf run-logs/web-dist
+mkdir -p run-logs/web-dist
+cp web/build/processedResources/js/main/index.html run-logs/web-dist/
+cp web/build/kotlin-webpack/js/developmentExecutable/stockman-monitor.js run-logs/web-dist/
 screen -dmS stockman-server bash -lc "cd '$ROOT_DIR' && server/build/install/server/bin/server > run-logs/server.log 2>&1"
-screen -dmS stockman-web bash -lc "cd '$ROOT_DIR' && ./gradlew --no-daemon -Dkotlin.daemon.jvm.options=-Xmx2g :web:jsBrowserDevelopmentRun > run-logs/web.log 2>&1"
+screen -dmS stockman-web bash -lc "cd '$ROOT_DIR/run-logs/web-dist' && python3 -m http.server 8081 > '$ROOT_DIR/run-logs/web.log' 2>&1"
 
 wait_for_port 8080 || true
 wait_for_port 8081 || true
@@ -87,4 +93,4 @@ wait_for_port 8081 || true
 echo "server: http://localhost:8080"
 echo "db:     http://localhost:8080/db"
 echo "web:    http://localhost:8081"
-echo "logs:   run-logs/server-build.log run-logs/server.log run-logs/web.log"
+echo "logs:   run-logs/server-build.log run-logs/web-build.log run-logs/server.log run-logs/web.log"
