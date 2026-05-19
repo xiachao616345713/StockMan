@@ -122,6 +122,13 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                 }
                 statement.executeUpdate(
                     """
+                    UPDATE monitor_config
+                    SET targetSources = 'limit_up,unusual_today,follow_stock'
+                    WHERE targetSources IN ('limit_up', 'limit_up,unusual_today')
+                    """.trimIndent()
+                )
+                statement.executeUpdate(
+                    """
                     CREATE TABLE IF NOT EXISTS monitor_alert (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         code TEXT NOT NULL,
@@ -699,9 +706,14 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
 
     fun upsertLimitUpPool(items: List<LimitUpPoolItem>, source: String): SyncWriteResult {
         if (items.isEmpty()) return SyncWriteResult(currentHistoryTargetDate(), 0, source, "no limit-up rows")
+        val date = items.maxOf { it.date }
         connection().use { conn ->
             conn.autoCommit = false
             try {
+                conn.prepareStatement("DELETE FROM limit_up_pool WHERE date = ?").use { ps ->
+                    ps.setInt(1, date)
+                    ps.executeUpdate()
+                }
                 conn.prepareStatement(
                     """
                     INSERT INTO limit_up_pool (
@@ -738,7 +750,6 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                     }
                     ps.executeBatch()
                 }
-                val date = items.maxOf { it.date }
                 setMeta(conn, "last_limit_up_pool_date", date.toString())
                 setMeta(conn, "last_limit_up_pool_count", items.size.toString())
                 conn.commit()
@@ -747,14 +758,19 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                 throw e
             }
         }
-        return SyncWriteResult(items.maxOf { it.date }, items.size, source, "limit-up pool synced")
+        return SyncWriteResult(date, items.size, source, "limit-up pool synced")
     }
 
     fun upsertZtReplay(items: List<ZtReplayItem>, source: String): SyncWriteResult {
         if (items.isEmpty()) return SyncWriteResult(currentHistoryTargetDate(), 0, source, "no replay rows")
+        val date = items.maxOf { it.date }
         connection().use { conn ->
             conn.autoCommit = false
             try {
+                conn.prepareStatement("DELETE FROM zt_replay WHERE date = ?").use { ps ->
+                    ps.setInt(1, date)
+                    ps.executeUpdate()
+                }
                 conn.prepareStatement(
                     """
                     INSERT INTO zt_replay (
@@ -787,7 +803,6 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                     }
                     ps.executeBatch()
                 }
-                val date = items.maxOf { it.date }
                 setMeta(conn, "last_zt_replay_date", date.toString())
                 setMeta(conn, "last_zt_replay_count", items.size.toString())
                 conn.commit()
@@ -796,7 +811,7 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                 throw e
             }
         }
-        return SyncWriteResult(items.maxOf { it.date }, items.size, source, "zt replay synced")
+        return SyncWriteResult(date, items.size, source, "zt replay synced")
     }
 
     fun monitorTargets(config: MonitorConfig = monitorConfig(), date: Int = currentRealtimeSnapshotDate()): MonitorTargetsResponse {

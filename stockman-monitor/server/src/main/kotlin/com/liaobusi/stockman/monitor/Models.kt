@@ -50,7 +50,7 @@ data class ManualTickRequest(
 @Serializable
 data class MonitorConfig(
     val enabled: Boolean = false,
-    val targetSources: List<String> = listOf("limit_up"),
+    val targetSources: List<String> = DEFAULT_MONITOR_TARGET_SOURCES,
     val customCodes: List<String> = emptyList(),
     val customBkCodes: List<String> = emptyList(),
     val cooldownSeconds: Int = 60,
@@ -58,6 +58,8 @@ data class MonitorConfig(
     val browserNotifyEnabled: Boolean = true,
     val updatedAt: Long = System.currentTimeMillis()
 )
+
+val DEFAULT_MONITOR_TARGET_SOURCES = listOf("limit_up", "unusual_today", "follow_stock")
 
 @Serializable
 data class MonitorConfigRequest(

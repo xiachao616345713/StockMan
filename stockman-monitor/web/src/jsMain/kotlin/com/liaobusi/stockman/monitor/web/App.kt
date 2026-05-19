@@ -90,7 +90,7 @@ fun MonitorApp() {
     val stockMetadataByCode = remember { mutableMapOf<String, StockTick>() }
     val localTrackers = remember { mutableMapOf<String, ClientMonitorTracker>() }
     val lastAlertByCodeAndType = remember { mutableMapOf<String, Long>() }
-    val selectedSources = remember { mutableStateListOf<String>() }
+    val selectedSources = remember { mutableStateListOf<String>().apply { addAll(DEFAULT_MONITOR_SOURCE_IDS) } }
     var connected by remember { mutableStateOf(false) }
     var activePage by remember { mutableStateOf("monitor") }
     var monitorSourcesByCode by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
@@ -99,7 +99,7 @@ fun MonitorApp() {
     var customCodes by remember { mutableStateOf("") }
     var customBkCodes by remember { mutableStateOf("") }
     var monitoringEnabled by remember { mutableStateOf(false) }
-    var backendTargetSources by remember { mutableStateOf(listOf("limit_up")) }
+    var backendTargetSources by remember { mutableStateOf(DEFAULT_MONITOR_TARGET_SOURCES) }
     var cooldownSeconds by remember { mutableStateOf(60) }
     var tradingTime by remember { mutableStateOf(isTradingTime()) }
     var sourceEditorOpen by remember { mutableStateOf(false) }
@@ -126,6 +126,19 @@ fun MonitorApp() {
         pendingAlerts.asReversed().forEach { alert -> alerts.add(0, alert) }
         while (alerts.size > 30) alerts.removeLast()
         pendingAlerts.clear()
+    }
+
+    fun applyMonitorSourceResult(result: MonitorSourceLoadResult) {
+        monitorSourcesByCode = result.sourcesByCode
+        monitorTargetsByCode = result.targetsByCode
+        monitorSourceStatus = result.message
+        val activeCodes = result.sourcesByCode.keys
+        localTrackers.keys.retainAll(activeCodes)
+        stockMetadataByCode.keys.retainAll(activeCodes)
+        lastAlertByCodeAndType.keys.removeAll { key -> key.substringBefore(":") !in activeCodes }
+        stocks.removeAll { it.code !in activeCodes }
+        alerts.removeAll { it.code !in activeCodes }
+        pendingAlerts.removeAll { it.code !in activeCodes }
     }
 
     LaunchedEffect(Unit) {
@@ -295,9 +308,22 @@ fun MonitorApp() {
                             backendTargetSources = backendTargetSources,
                             cooldownSeconds = cooldownSeconds
                         ) { result ->
-                            monitorSourcesByCode = result.sourcesByCode
-                            monitorTargetsByCode = result.targetsByCode
-                            monitorSourceStatus = result.message
+                            applyMonitorSourceResult(result)
+                            kotlinx.coroutines.GlobalScope.promise { loadStockTicks(result.sourcesByCode.keys) }
+                                .then { metadata ->
+                                    val byCode = stocks.associateBy { it.code }.toMutableMap()
+                                    metadata.forEach { tick ->
+                                        stockMetadataByCode[tick.code] = tick
+                                        byCode[tick.code] = tick
+                                    }
+                                    replaceStocksPreservingViewport(
+                                        stocks = stocks,
+                                        nextStocks = byCode.values
+                                            .filter { it.code in result.sourcesByCode.keys }
+                                            .sortedByDescending { it.chg }
+                                    )
+                                    null
+                                }
                         }
                     }
                 )
@@ -419,6 +445,9 @@ fun Header(
 fun FollowPage() {
     var follows by remember { mutableStateOf<List<MonitorFollowItem>>(emptyList()) }
     var status by remember { mutableStateOf("加载中") }
+    var newStockCode by remember { mutableStateOf("") }
+    var newStockName by remember { mutableStateOf("") }
+    var addStatus by remember { mutableStateOf("") }
 
     fun reload() {
         kotlinx.coroutines.GlobalScope.promise { loadMonitorFollows() }
@@ -449,6 +478,34 @@ fun FollowPage() {
         FollowGroup(
             title = "个股",
             follows = follows.filter { it.type == 1 },
+            addContent = {
+                FollowAddStockForm(
+                    code = newStockCode,
+                    name = newStockName,
+                    status = addStatus,
+                    onCodeChange = { newStockCode = it },
+                    onNameChange = { newStockName = it },
+                    onAdd = {
+                        val code = normalizeStockCode(newStockCode).orEmpty()
+                        if (code.isBlank()) {
+                            addStatus = "请输入 6 位股票代码"
+                            return@FollowAddStockForm
+                        }
+                        updateMonitorFollowAsync(
+                            code = code,
+                            type = 1,
+                            add = true,
+                            name = newStockName.trim(),
+                            stickyOnTop = 1
+                        ) { message ->
+                            addStatus = message
+                            newStockCode = ""
+                            newStockName = ""
+                            reload()
+                        }
+                    }
+                )
+            },
             onChanged = { reload() }
         )
         FollowGroup(
@@ -463,9 +520,11 @@ fun FollowPage() {
 private fun FollowGroup(
     title: String,
     follows: List<MonitorFollowItem>,
+    addContent: (@Composable () -> Unit)? = null,
     onChanged: () -> Unit
 ) {
     H2({ classes(AppStyles.followGroupTitle) }) { Text(title) }
+    addContent?.invoke()
     if (follows.isEmpty()) {
         Div({ classes(AppStyles.emptyState) }) { Text("暂无关注") }
         return
@@ -511,6 +570,37 @@ private fun FollowGroup(
                     canMoveDown = index < follows.lastIndex
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun FollowAddStockForm(
+    code: String,
+    name: String,
+    status: String,
+    onCodeChange: (String) -> Unit,
+    onNameChange: (String) -> Unit,
+    onAdd: () -> Unit
+) {
+    Div({ classes(AppStyles.followAddForm) }) {
+        Input(type = InputType.Text) {
+            value(code)
+            placeholder("股票代码")
+            attr("maxlength", "6")
+            onInput { onCodeChange(it.value) }
+        }
+        Input(type = InputType.Text) {
+            value(name)
+            placeholder("名称可选")
+            onInput { onNameChange(it.value) }
+        }
+        Button(attrs = {
+            classes(AppStyles.primaryButton)
+            onClick { onAdd() }
+        }) { Text("新增个股") }
+        if (status.isNotBlank()) {
+            Span({ classes(AppStyles.statusMeta) }) { Text(status) }
         }
     }
 }
@@ -1572,7 +1662,7 @@ private fun mergeSourceMaps(left: Map<String, String>, right: Map<String, String
 }
 
 private fun normalizeBackendTargetSources(sources: List<String>): List<String> {
-    if (sources.isEmpty()) return listOf("limit_up")
+    if (sources.isEmpty()) return DEFAULT_MONITOR_TARGET_SOURCES
     val normalized = linkedSetOf<String>()
     sources.forEach { source ->
         when (source) {
@@ -1580,7 +1670,7 @@ private fun normalizeBackendTargetSources(sources: List<String>): List<String> {
             "unusual_today", "follow_stock" -> normalized.add(source)
         }
     }
-    return normalized.ifEmpty { linkedSetOf("limit_up") }.toList()
+    return normalized.ifEmpty { DEFAULT_MONITOR_TARGET_SOURCES.toCollection(linkedSetOf()) }.toList()
 }
 
 private fun saveMonitorConfigAsync(
@@ -2395,6 +2485,14 @@ object AppStyles : StyleSheet() {
         display(DisplayStyle.Flex)
         gap(8.px)
         property("flex-wrap", "wrap")
+    }
+
+    val followAddForm by style {
+        display(DisplayStyle.Flex)
+        alignItems(AlignItems.Center)
+        gap(8.px)
+        property("flex-wrap", "wrap")
+        padding(10.px, 0.px, 4.px, 0.px)
     }
 
     val sourceIcon by style {

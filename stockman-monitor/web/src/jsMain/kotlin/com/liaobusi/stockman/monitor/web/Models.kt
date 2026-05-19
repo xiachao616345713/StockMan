@@ -34,7 +34,7 @@ data class AlertEvent(
 @Serializable
 data class MonitorConfig(
     val enabled: Boolean = false,
-    val targetSources: List<String> = listOf("limit_up"),
+    val targetSources: List<String> = DEFAULT_MONITOR_TARGET_SOURCES,
     val customCodes: List<String> = emptyList(),
     val customBkCodes: List<String> = emptyList(),
     val cooldownSeconds: Int = 60,
@@ -42,6 +42,9 @@ data class MonitorConfig(
     val browserNotifyEnabled: Boolean = true,
     val updatedAt: Long = 0
 )
+
+val DEFAULT_MONITOR_TARGET_SOURCES = listOf("limit_up", "unusual_today", "follow_stock")
+val DEFAULT_MONITOR_SOURCE_IDS = listOf("ths-hot")
 
 @Serializable
 data class MonitorTarget(
