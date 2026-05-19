@@ -120,12 +120,12 @@ fun Route.registerSyncRoutes(engine: MarketEngine, logger: Logger) {
     }
     post("/api/sync/limit-up-pool") {
         val date = call.request.queryParameters["date"]?.toIntOrNull()
-            ?: ChinaMarketCalendar.currentHistoryTargetDate()
+            ?: ChinaMarketCalendar.currentRealtimeSnapshotDate()
         call.respond(engine.syncLimitUpPool(date))
     }
     post("/api/sync/zt-replay") {
         val date = call.request.queryParameters["date"]?.toIntOrNull()
-            ?: ChinaMarketCalendar.currentHistoryTargetDate()
+            ?: ChinaMarketCalendar.currentRealtimeSnapshotDate()
         call.respond(engine.syncZtReplay(date))
     }
     post("/api/sync/history/start") {

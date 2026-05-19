@@ -62,6 +62,6 @@ fun isTradingTime(): Boolean {
     val hour = date.getHours() as Int
     val minute = date.getMinutes() as Int
     val minutes = hour * 60 + minute
-    return minutes in (9 * 60 + 25)..(11 * 60 + 30) ||
-        minutes in (13 * 60)..(15 * 60)
+    return minutes >= 9 * 60 + 25 && minutes < 11 * 60 + 30 ||
+        minutes >= 13 * 60 && minutes < 15 * 60
 }

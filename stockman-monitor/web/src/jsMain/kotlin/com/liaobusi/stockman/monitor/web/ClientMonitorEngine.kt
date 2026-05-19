@@ -38,28 +38,51 @@ data class ClientAlertSignal(
 class ClientMonitorTracker {
     private val cache = mutableListOf<StockTick>()
     private val speedStrategy = ClientSpeedMonitorStrategy()
+    private var limitUpSealed = false
+    private var limitDownSealed = false
+    private var hasSeenLimitUp = false
+    private var hasSeenLimitDown = false
 
     fun update(stock: StockTick): ClientAlertCandidate? {
         val events = mutableListOf<ClientAlertSignal>()
-        val last = cache.lastOrNull()
-        if (last != null) {
-            if (samePrice(stock.ztPrice, stock.price) && !samePrice(last.price, last.ztPrice)) {
+        val currentLimitUpSealed = isLimitUpSealed(stock)
+        val currentLimitDownSealed = isLimitDownSealed(stock)
+
+        if (cache.isNotEmpty()) {
+            if (currentLimitUpSealed && !limitUpSealed) {
                 events += ClientAlertSignal("LIMIT_UP", "[涨停]")
             }
-            if (samePrice(last.ztPrice, last.price) && stock.price < stock.ztPrice) {
+            if (hasSeenLimitUp && limitUpSealed && !currentLimitUpSealed) {
                 events += ClientAlertSignal("BREAK_LIMIT_UP", "[炸板]")
             }
-            if (samePrice(stock.dtPrice, stock.price) && !samePrice(last.price, last.dtPrice)) {
+            if (currentLimitDownSealed && !limitDownSealed) {
                 events += ClientAlertSignal("LIMIT_DOWN", "[跌停]")
             }
-            if (samePrice(last.dtPrice, last.price) && stock.price > stock.dtPrice) {
+            if (hasSeenLimitDown && limitDownSealed && !currentLimitDownSealed) {
                 events += ClientAlertSignal("OPEN_LIMIT_DOWN", "[翘板]")
             }
             events += speedStrategy.evaluate(cache, stock)
         }
+
+        if (currentLimitUpSealed) hasSeenLimitUp = true
+        if (currentLimitDownSealed) hasSeenLimitDown = true
+        limitUpSealed = currentLimitUpSealed
+        limitDownSealed = currentLimitDownSealed
         cache += stock
         if (cache.size > 80) cache.removeAt(0)
         return events.takeIf { it.isNotEmpty() }?.let { ClientAlertCandidate(stock, it) }
+    }
+
+    private fun isLimitUpSealed(stock: StockTick): Boolean {
+        return stock.price > 0.0 && stock.ztPrice > 0.0 && stock.price >= stock.ztPrice - PRICE_EPSILON
+    }
+
+    private fun isLimitDownSealed(stock: StockTick): Boolean {
+        return stock.price > 0.0 && stock.dtPrice > 0.0 && stock.price <= stock.dtPrice + PRICE_EPSILON
+    }
+
+    private companion object {
+        const val PRICE_EPSILON = 0.005
     }
 }
 

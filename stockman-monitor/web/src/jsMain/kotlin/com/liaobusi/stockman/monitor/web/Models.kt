@@ -12,6 +12,8 @@ data class StockTick(
     val chg: Double,
     val ztPrice: Double,
     val dtPrice: Double,
+    val highest: Double = 0.0,
+    val lowest: Double = 0.0,
     val bk: String = "",
     val time: Long
 )

@@ -73,6 +73,7 @@ import org.jetbrains.compose.web.renderComposable
 
 private val json = Json { ignoreUnknownKeys = true }
 private const val MONITOR_QUOTE_REFRESH_MS = 2_000L
+private const val TRADING_TIME_CHECK_MS = 5_000L
 
 fun main() {
     renderComposable(rootElementId = "root") {
@@ -144,11 +145,19 @@ fun MonitorApp() {
     LaunchedEffect(Unit) {
         runCatching {
             val config = loadMonitorConfig()
-            monitoringEnabled = config.enabled
-            backendTargetSources = normalizeBackendTargetSources(config.targetSources)
-            customCodes = config.customCodes.joinToString(" ")
-            customBkCodes = config.customBkCodes.joinToString(" ")
+            val currentTradingTime = isTradingTime()
+            val nextTargetSources = normalizeBackendTargetSources(config.targetSources)
+            val nextCustomCodes = config.customCodes.joinToString(" ")
+            val nextCustomBkCodes = config.customBkCodes.joinToString(" ")
+            tradingTime = currentTradingTime
+            monitoringEnabled = config.enabled && currentTradingTime
+            backendTargetSources = nextTargetSources
+            customCodes = nextCustomCodes
+            customBkCodes = nextCustomBkCodes
             cooldownSeconds = config.cooldownSeconds
+            if (config.enabled && !currentTradingTime) {
+                saveMonitorConfigAsync(false, nextTargetSources, nextCustomCodes, nextCustomBkCodes, config.cooldownSeconds) {}
+            }
             alerts.clear()
             localAlertHistory.value = loadLocalAlertHistory()
             connected = true
@@ -162,8 +171,9 @@ fun MonitorApp() {
             tradingTime = isTradingTime()
             if (!tradingTime && monitoringEnabled) {
                 monitoringEnabled = false
+                saveMonitorConfigAsync(false, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
             }
-            delay(30_000)
+            delay(TRADING_TIME_CHECK_MS)
         }
     }
 
@@ -190,7 +200,14 @@ fun MonitorApp() {
     }
 
     LaunchedEffect(monitoringEnabled, tradingTime, monitorSourcesByCode.keys.sorted().joinToString(",")) {
-        while (monitoringEnabled && tradingTime) {
+        while (monitoringEnabled) {
+            val currentTradingTime = isTradingTime()
+            tradingTime = currentTradingTime
+            if (!currentTradingTime) {
+                monitoringEnabled = false
+                saveMonitorConfigAsync(false, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
+                break
+            }
             val targetCodes = monitorSourcesByCode.keys
             if (targetCodes.isNotEmpty()) {
                 runCatching {
@@ -353,7 +370,9 @@ fun MonitorApp() {
                         tradingTime = tradingTime,
                         meta = "${monitorStocks.size} 只标的",
                         onStart = {
-                            if (isTradingTime()) {
+                            val currentTradingTime = isTradingTime()
+                            tradingTime = currentTradingTime
+                            if (currentTradingTime) {
                                 saveMonitorConfigAsync(true, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
                                 monitoringEnabled = true
                             }
@@ -1288,7 +1307,8 @@ fun AlertList(
 
 @Composable
 private fun AlertEventBadge(alert: AlertEvent) {
-    Span({ classes(AppStyles.alertBadge) }) { Text(alertEventLabel(alert.primaryEventType())) }
+    val type = alert.primaryEventType()
+    Span({ classes(AppStyles.alertBadge, alertBadgeStyle(type)) }) { Text(alertEventLabel(type)) }
 }
 
 @Composable
@@ -1596,6 +1616,8 @@ private suspend fun fetchSinaRealtimeTicks(targetCodes: Set<String>): List<Stock
             val name = row.name?.toString().orEmpty()
             val price = row.trade?.toString()?.toDoubleOrNull() ?: 0.0
             val previousClose = row.settlement?.toString()?.toDoubleOrNull() ?: 0.0
+            val high = row.high?.toString()?.toDoubleOrNull() ?: price
+            val low = row.low?.toString()?.toDoubleOrNull() ?: price
             if (code.isBlank() || name.isBlank() || price <= 0.0 || previousClose <= 0.0) continue
             val chg = row.changepercent?.toString()?.toDoubleOrNull() ?: ((price - previousClose) / previousClose * 100.0)
             val limit = stockLimitRate(code, name)
@@ -1605,6 +1627,8 @@ private suspend fun fetchSinaRealtimeTicks(targetCodes: Set<String>): List<Stock
                     name = name,
                     price = money(price),
                     chg = percent(chg),
+                    highest = money(high),
+                    lowest = money(low),
                     ztPrice = money(previousClose * limit),
                     dtPrice = money(previousClose * stockDownLimitRate(code, name)),
                     bk = "",
@@ -1618,6 +1642,8 @@ private suspend fun fetchSinaRealtimeTicks(targetCodes: Set<String>): List<Stock
 private fun mergeClientStockTick(tick: StockTick, cached: StockTick?): StockTick {
     if (cached == null) return tick
     return tick.copy(
+        highest = tick.highest.takeIf { it > 0.0 } ?: cached.highest,
+        lowest = tick.lowest.takeIf { it > 0.0 } ?: cached.lowest,
         ztPrice = cached.ztPrice.takeIf { it > 0.0 } ?: tick.ztPrice,
         dtPrice = cached.dtPrice.takeIf { it > 0.0 } ?: tick.dtPrice,
         bk = cached.bk.ifBlank { tick.bk }
@@ -2175,12 +2201,31 @@ object AppStyles : StyleSheet() {
     }
 
     val alertBadge by style {
-        background("#20242a")
         color(Color.white)
         borderRadius(6.px)
         padding(3.px, 6.px)
         fontSize(12.px)
         fontWeight("800")
+    }
+
+    val alertBadgeUp by style {
+        background("#dc2626")
+    }
+
+    val alertBadgeDown by style {
+        background("#16a34a")
+    }
+
+    val alertBadgeLimitUp by style {
+        background("#7c3aed")
+    }
+
+    val alertBadgeLimitDown by style {
+        background("#111827")
+    }
+
+    val alertBadgeNeutral by style {
+        background("#20242a")
     }
 
     val alertTitle by style {
@@ -2311,11 +2356,11 @@ object AppStyles : StyleSheet() {
     }
 
     val alertTimelinePointBreakLimitUp by style {
-        timelinePoint("#f97316")
+        timelinePoint("#16a34a")
     }
 
     val alertTimelinePointOpenLimitDown by style {
-        timelinePoint("#2563eb")
+        timelinePoint("#dc2626")
     }
 
     val alertTimelineTime by style {

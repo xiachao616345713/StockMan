@@ -55,6 +55,16 @@ fun alertTimelineDotStyle(type: String): String? {
     }
 }
 
+fun alertBadgeStyle(type: String): String {
+    return when (type) {
+        "SPIKE", "OPEN_LIMIT_DOWN" -> AppStyles.alertBadgeUp
+        "DROP", "BREAK_LIMIT_UP" -> AppStyles.alertBadgeDown
+        "LIMIT_UP" -> AppStyles.alertBadgeLimitUp
+        "LIMIT_DOWN" -> AppStyles.alertBadgeLimitDown
+        else -> AppStyles.alertBadgeNeutral
+    }
+}
+
 fun notificationLabel(state: String): String {
     return when (state) {
         "granted" -> "已开启"

@@ -168,6 +168,10 @@ class MarketEngine {
     }
 
     fun startMonitor(): MonitorStatus {
+        if (!isTradingSession()) {
+            val config = database.saveMonitorConfig(MonitorConfigRequest(enabled = false))
+            return monitorStatus(config).copy(lastMessage = "非交易时间，监控未启动")
+        }
         val config = database.saveMonitorConfig(MonitorConfigRequest(enabled = true))
         return monitorStatus(config)
     }
@@ -185,7 +189,11 @@ class MarketEngine {
             tradingTime = isTradingSession(),
             targetCount = targets.size,
             alertCount = 0,
-            lastMessage = if (config.enabled) "监控已开启" else "监控已停止"
+            lastMessage = when {
+                config.enabled && (!config.tradingTimeOnly || isTradingSession()) -> "监控运行中"
+                config.enabled -> "非交易时间，监控未运行"
+                else -> "监控已停止"
+            }
         )
     }
 
@@ -210,7 +218,7 @@ class MarketEngine {
         return database.insertUnusualAction(request)
     }
 
-    suspend fun syncLimitUpPool(date: Int = ChinaMarketCalendar.currentHistoryTargetDate()): SyncWriteResult {
+    suspend fun syncLimitUpPool(date: Int = ChinaMarketCalendar.currentRealtimeSnapshotDate()): SyncWriteResult {
         val items = mutableListOf<LimitUpPoolItem>()
         var page = 1
         while (true) {
@@ -243,7 +251,7 @@ class MarketEngine {
         return result
     }
 
-    suspend fun syncZtReplay(date: Int = ChinaMarketCalendar.currentHistoryTargetDate()): SyncWriteResult {
+    suspend fun syncZtReplay(date: Int = ChinaMarketCalendar.currentRealtimeSnapshotDate()): SyncWriteResult {
         val response = thsApi.getZtReplay(date)
         val items = response.data.orEmpty().flatMap { block ->
             val groupName = block.name ?: block.blockName.orEmpty()
@@ -385,7 +393,7 @@ class MarketEngine {
     private fun isTradingSession(now: LocalDateTime = LocalDateTime.now(RealtimeStockSync.CHINA_ZONE)): Boolean {
         if (!ChinaMarketCalendar.isTradingDay(now.toLocalDate())) return false
         val time = now.toLocalTime()
-        return (time > LocalTime.of(9, 30) && time < LocalTime.of(11, 30)) ||
+        return (time >= LocalTime.of(9, 25) && time < LocalTime.of(11, 30)) ||
             (time >= LocalTime.of(13, 0) && time < LocalTime.of(15, 0))
     }
 

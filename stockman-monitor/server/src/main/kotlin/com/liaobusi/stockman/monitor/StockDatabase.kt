@@ -247,7 +247,7 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
     }
 
     fun getStocks(): List<StockTick> = connection().use { conn ->
-        conn.prepareStatement("SELECT code, name, price, chg, ztPrice, dtPrice, bk FROM stock ORDER BY code").use { ps ->
+        conn.prepareStatement("SELECT code, name, price, chg, highest, lowest, ztPrice, dtPrice, bk FROM stock ORDER BY code").use { ps ->
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) {
@@ -257,6 +257,8 @@ class StockDatabase(private val dbPath: Path = defaultDatabasePath()) {
                                 name = rs.getString("name"),
                                 price = rs.getDouble("price"),
                                 chg = rs.getDouble("chg"),
+                                highest = rs.getDouble("highest"),
+                                lowest = rs.getDouble("lowest"),
                                 ztPrice = rs.getDouble("ztPrice"),
                                 dtPrice = rs.getDouble("dtPrice"),
                                 bk = rs.getString("bk")

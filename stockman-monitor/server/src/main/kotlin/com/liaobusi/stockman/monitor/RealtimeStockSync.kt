@@ -52,6 +52,8 @@ class RealtimeStockSync(private val database: StockDatabase) {
                     name = stock.name,
                     price = stock.price,
                     chg = stock.chg,
+                    highest = stock.highest,
+                    lowest = stock.lowest,
                     ztPrice = stock.ztPrice,
                     dtPrice = stock.dtPrice,
                     bk = stock.bk,
