@@ -1,0 +1,445 @@
+/* ==========================================================================
+   全局样式：暗色行情终端主题
+   颜色约定（CLAUDE.md「Color Conventions」）：红涨绿跌
+   ========================================================================== */
+
+:root {
+    --bg: #0b0e13;
+    --panel: #12161f;
+    --panel-2: #171d29;
+    --border: #232a38;
+    --text: #d5d9e0;
+    --text-strong: #f2f5f9;
+    --muted: #7c8698;
+    --up: #f6465d;
+    --down: #2ebd85;
+    --flat: #9aa3b2;
+    --accent: #4f8cff;
+    --warn: #f0b90b;
+    --radius: 10px;
+    --font-mono: 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+        'Microsoft YaHei', 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+}
+
+#app {
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+}
+
+.up {
+    color: var(--up);
+}
+
+.down {
+    color: var(--down);
+}
+
+.flat {
+    color: var(--flat);
+}
+
+/* ---------- 布局 ---------- */
+
+.app-header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    padding: 0 24px;
+    height: 56px;
+    background: rgba(11, 14, 19, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+}
+
+.app-logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 17px;
+    font-weight: 700;
+    color: var(--text-strong);
+    white-space: nowrap;
+}
+
+.app-logo .logo-icon {
+    font-size: 20px;
+}
+
+.app-nav {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+}
+
+.nav-tab {
+    padding: 7px 16px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.nav-tab:hover {
+    color: var(--text);
+    background: var(--panel-2);
+}
+
+.nav-tab.is-active {
+    color: var(--text-strong);
+    background: var(--panel-2);
+    font-weight: 600;
+}
+
+.session-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.gear-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.gear-btn:hover {
+    color: var(--text-strong);
+    border-color: var(--accent);
+    background: var(--panel-2);
+}
+
+.gear-btn.is-active {
+    color: #fff;
+    border-color: var(--accent);
+    background: var(--accent);
+}
+
+.session-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+}
+
+.session-dot.is-trading {
+    background: var(--down);
+    box-shadow: 0 0 6px var(--down);
+}
+
+.app-main {
+    flex: 1;
+    width: 100%;
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 20px 24px 40px;
+}
+
+.app-footer {
+    padding: 16px 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+}
+
+.app-footer a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+/* ---------- 面板 ---------- */
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+}
+
+.panel-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.panel-title h2 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-strong);
+}
+
+.panel-title .sub {
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 400;
+}
+
+.grid-2col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+@media (max-width: 900px) {
+    .grid-2col {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ---------- 表格 ---------- */
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+table.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    white-space: nowrap;
+}
+
+.data-table th {
+    padding: 8px 10px;
+    text-align: right;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    user-select: none;
+}
+
+.data-table th:first-child,
+.data-table td:first-child {
+    text-align: left;
+}
+
+.data-table th.is-sortable {
+    cursor: pointer;
+}
+
+.data-table th.is-sortable:hover {
+    color: var(--text);
+}
+
+.data-table th .sort-arrow {
+    font-size: 10px;
+    margin-left: 2px;
+}
+
+.data-table td {
+    padding: 7px 10px;
+    text-align: right;
+    border-bottom: 1px solid rgba(35, 42, 56, 0.5);
+    font-size: 13px;
+}
+
+.data-table tbody tr {
+    transition: background 0.1s;
+}
+
+.data-table tbody tr:hover {
+    background: var(--panel-2);
+}
+
+.data-table tbody tr.is-clickable {
+    cursor: pointer;
+}
+
+.data-table tbody tr.is-selected {
+    background: rgba(79, 140, 255, 0.08);
+}
+
+.cell-code {
+    font-family: var(--font-mono);
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.cell-name {
+    color: var(--text-strong);
+    font-weight: 500;
+}
+
+/* ---------- 控件 ---------- */
+
+.btn {
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.btn:hover {
+    border-color: var(--accent);
+    color: var(--text-strong);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn.is-active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.btn-group {
+    display: inline-flex;
+    gap: 6px;
+}
+
+.input {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text-strong);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+}
+
+.input:focus {
+    border-color: var(--accent);
+}
+
+.input::placeholder {
+    color: var(--muted);
+}
+
+/* ---------- 标签/徽章 ---------- */
+
+.tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 18px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+}
+
+.tag.tag-up {
+    color: var(--up);
+    border-color: rgba(246, 70, 93, 0.4);
+    background: rgba(246, 70, 93, 0.08);
+}
+
+.tag.tag-down {
+    color: var(--down);
+    border-color: rgba(46, 189, 133, 0.4);
+    background: rgba(46, 189, 133, 0.08);
+}
+
+.tag.tag-accent {
+    color: var(--accent);
+    border-color: rgba(79, 140, 255, 0.4);
+    background: rgba(79, 140, 255, 0.08);
+}
+
+.tag.tag-warn {
+    color: var(--warn);
+    border-color: rgba(240, 185, 11, 0.4);
+    background: rgba(240, 185, 11, 0.08);
+}
+
+/* ---------- 状态提示 ---------- */
+
+.state-box {
+    padding: 40px 16px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.state-box.error {
+    color: var(--up);
+}
+
+.loading-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: -2px;
+    margin-right: 6px;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.meta-line {
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}

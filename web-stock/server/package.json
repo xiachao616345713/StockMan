@@ -1,0 +1,14 @@
+{
+  "name": "web-stock-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "股票行情查询 Web 后端：零依赖 Node.js 服务，代理上游行情接口并托管前端静态资源",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

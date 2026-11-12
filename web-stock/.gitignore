@@ -1,0 +1,13 @@
+# 依赖与构建产物
+node_modules/
+web/dist/
+
+# LLM 本地配置（含 access_token，严禁提交）
+server/llm.config.json
+
+# 历史数据归档（本地运行期生成，见 docs/design.md D15）
+server/data/
+
+# 系统与日志杂项
+.DS_Store
+*.log
