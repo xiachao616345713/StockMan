@@ -57,20 +57,26 @@ function defaults() {
             maxTokens: 2048,
         },
         agent: { maxRounds: 6, maxMessages: 30, maxContent: 4000 },
+        // 收盘后默认 24h（v1.6.0，D19）：收盘后数据静态可长缓存，实际过期时间由 api.js#cacheTtl
+        // 封顶到下一个交易日开盘（否则周一盘前会命中上周五旧快照）。
+        // 龙虎榜例外（1h）：收盘后约 17:00 才发布，傍晚数据经历「空 → 有」变化，不宜过长。
         cache: {
-            snapshot: { trading: 30, closed: 600 },
-            indices: { trading: 30, closed: 600 },
-            kline: { trading: 60, closed: 1800 },
-            sectors: { trading: 60, closed: 900 },
-            bkstocks: { trading: 60, closed: 900 },
-            limitup: { trading: 120, closed: 1800 },
-            ladder: { trading: 120, closed: 1800 },
-            related: { trading: 300, closed: 1800 },
-            dragontiger: { trading: 300, closed: 1800 },
-            hotrank: { trading: 300, closed: 600 },
+            snapshot: { trading: 30, closed: 86_400 },
+            indices: { trading: 30, closed: 86_400 },
+            kline: { trading: 60, closed: 86_400 },
+            sectors: { trading: 60, closed: 86_400 },
+            bkstocks: { trading: 60, closed: 86_400 },
+            limitup: { trading: 120, closed: 86_400 },
+            ladder: { trading: 120, closed: 86_400 },
+            related: { trading: 300, closed: 86_400 },
+            dragontiger: { trading: 300, closed: 3_600 },
+            hotrank: { trading: 300, closed: 86_400 },
         },
         server: { port: 8787, tradingStart: '09:15', tradingEnd: '15:05' },
-        http: { timeoutMs: 10_000, retries: 1, retryBackoffMs: 300 },
+        // minIntervalMs/maxConcurrent（v1.6.1，D20）：按主机限流，防上游隐性频率限制
+        // （触发后返回空数据/拒绝连接）。默认同一主机相邻请求间隔 ≥100ms、并发 ≤4，
+        // 快照分页（≈60 页）由此前的 6 并发瞬时突发变为平滑拉取（全量约 6–8s，TTL 30s 内可接受）。
+        http: { timeoutMs: 10_000, retries: 1, retryBackoffMs: 300, minIntervalMs: 100, maxConcurrent: 4 },
     };
 }
 
@@ -269,7 +275,9 @@ function mergeCache(dst, src) {
             if (subKey !== 'trading' && subKey !== 'closed') {
                 throw new ConfigError(`${p}.${key} 含未知字段: ${subKey}（仅 trading/closed）`);
             }
-            dst[key][subKey] = reqInt(subVal, `${p}.${key}.${subKey}`, 5, 7200);
+            // trading 上限 2h（盘中时效性要求）；closed 上限 24h（v1.6.0，实际过期仍封顶到下一交易日开盘）
+            const max = subKey === 'closed' ? 86_400 : 7_200;
+            dst[key][subKey] = reqInt(subVal, `${p}.${key}.${subKey}`, 5, max);
         }
     }
 }
@@ -296,6 +304,8 @@ function mergeHttp(dst, src) {
             case 'timeoutMs': dst.timeoutMs = reqInt(value, `${p}.timeoutMs`, 1_000, 120_000); break;
             case 'retries': dst.retries = reqInt(value, `${p}.retries`, 0, 5); break;
             case 'retryBackoffMs': dst.retryBackoffMs = reqInt(value, `${p}.retryBackoffMs`, 0, 10_000); break;
+            case 'minIntervalMs': dst.minIntervalMs = reqInt(value, `${p}.minIntervalMs`, 0, 10_000); break;
+            case 'maxConcurrent': dst.maxConcurrent = reqInt(value, `${p}.maxConcurrent`, 1, 32); break;
             default: throw new ConfigError(`${p} 含未知字段: ${key}`);
         }
     }

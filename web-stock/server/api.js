@@ -7,10 +7,21 @@
  */
 
 import { cached } from './lib/cache.js';
-import { isTradingTime, secIdForStock, boardNameOf, limitPctOf, todayYyyymmdd, ttlBySession } from './lib/market.js';
-import { runAgent } from './lib/agent.js';
+import { isTradingTime, secIdForStock, boardNameOf, limitPctOf, todayYyyymmdd, secondsUntilNextTradingStart } from './lib/market.js';
+import { runAgent, getAgentMeta } from './lib/agent.js';
 import { isLlmConfigured, LlmConfigError, LlmError } from './lib/llm.js';
-import { saveRecordThrottled } from './lib/history.js';
+import { saveRecordThrottled, loadRecordWithMeta } from './lib/history.js';
+import {
+    listSessions,
+    createSession,
+    getSession,
+    updateSessionTitle,
+    deleteSession,
+    appendMessage,
+    listMessages,
+    saveTrace,
+    getTrace,
+} from './lib/chat-store.js';
 import { getConfig, getGroup, maskSecrets, update as updateConfig, ConfigError, storeInfo } from './lib/config.js';
 import * as eastmoney from './sources/eastmoney.js';
 import * as sina from './sources/sina.js';
@@ -33,15 +44,67 @@ export class ApiError extends Error {
 // ---------------------------------------------------------------------------
 
 /**
- * 按配置选择缓存 TTL：读 config.cache[key]（{trading,closed} 秒），交交易时段判断折算为毫秒。
+ * 按配置选择缓存 TTL：读 config.cache[key]（{trading,closed} 秒），按交易时段折算为毫秒。
  * 使用时调用（勿缓存），设置页改值后下一次取数即生效。
+ *
+ * 收盘后封顶（v1.6.0，见 docs/design.md D19）：收盘后数据静态可长缓存（配置上限 24h），
+ * 但实际过期时间封顶到下一个交易日开盘——否则周一盘前会命中上周五的旧快照。
  *
  * @param {string} key config.js CACHE_KEYS 之一（snapshot/indices/kline/...）
  * @returns {number} TTL 毫秒
  */
 function cacheTtl(key) {
     const entry = getGroup('cache')[key];
-    return ttlBySession(entry.trading * 1000, entry.closed * 1000);
+    if (isTradingTime()) {
+        return entry.trading * 1000;
+    }
+    return Math.min(entry.closed, secondsUntilNextTradingStart()) * 1000;
+}
+
+// ---------------------------------------------------------------------------
+// 历史日期归档直读（v1.6.0，见 docs/design.md D19）
+// ---------------------------------------------------------------------------
+
+/** 归档数据是否为空占位（池/龙虎榜 list 为空、天梯无分层） */
+function isArchiveEmpty(data) {
+    if (Array.isArray(data?.list)) {
+        return data.list.length === 0;
+    }
+    if (Array.isArray(data?.tiers)) {
+        return data.tiers.length === 0;
+    }
+    return false;
+}
+
+/** yyyyMMdd 是否工作日（UTC 正午锚定避免时区偏移；不识别节假日） */
+function isWeekday8(date8) {
+    const day = new Date(`${date8.slice(0, 4)}-${date8.slice(4, 6)}-${date8.slice(6, 8)}T12:00:00Z`).getUTCDay();
+    return day !== 0 && day !== 6;
+}
+
+/**
+ * 历史日期归档直读：date8 早于今天（上海）且归档存在 → 直接返回，零上游请求。
+ * - 工作日的空归档视为未命中（可能是盘前/龙虎榜未发布等中途快照，回退上游取终态）；
+ *   周末空归档属正常（非交易日占位），照常返回，避免节假日反复拉上游；
+ * - 今天的日期不走归档（当日归档是盘中持续更新的副本，读它会拿到旧数据）；
+ * - 返回形状与 cached() 兼容（value/fromCache/fromArchive/archiveSavedAt），可直接给 metaOf。
+ *
+ * @param {string} type HISTORY_TYPES 之一
+ * @param {string} date8 交易日 yyyyMMdd
+ * @returns {Promise<{value: any, fromCache: true, fromArchive: true, archiveSavedAt: string|null}|null>} 未命中返回 null
+ */
+async function tryArchive(type, date8) {
+    if (date8 >= todayYyyymmdd()) {
+        return null;
+    }
+    const record = await loadRecordWithMeta(type, date8);
+    if (!record) {
+        return null;
+    }
+    if (isArchiveEmpty(record.data) && isWeekday8(date8)) {
+        return null; // 中途空快照，不作为历史终态返回
+    }
+    return { value: record.data, fromCache: true, fromArchive: true, archiveSavedAt: record.savedAt };
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +127,12 @@ async function getSnapshot() {
 // 同日期只拉一次上游；缓存 key 与 /api/limitup/pool、/api/limitup/replay 一致）
 // ---------------------------------------------------------------------------
 
-function getLimitUpPool(date) {
+async function getLimitUpPool(date) {
+    // 历史日期先读归档（v1.6.0）：命中零上游请求；关联分析的历史回看同样受益
+    const archived = await tryArchive('limitup', date);
+    if (archived) {
+        return archived;
+    }
     return cached(`limitup:pool:${date}`, cacheTtl('limitup'), async () => ths.fetchLimitUpPool(date));
 }
 
@@ -176,6 +244,8 @@ function metaOf(result, extra = {}) {
         source: result.value?.source ?? 'unknown',
         fetchedAt: new Date().toISOString(),
         fromCache: result.fromCache,
+        // 归档直读时附加标记（v1.6.0）：fromArchive=true + 归档落盘时间，便于前端/排查区分数据来源
+        ...(result.fromArchive ? { fromArchive: true, archiveSavedAt: result.archiveSavedAt ?? null } : {}),
         ...extra,
     };
 }
@@ -209,11 +279,23 @@ const routes = {
     '/api/health': async () => ({
         data: {
             ok: true,
-            version: '1.4.0',
+            version: '1.6.2',
             isTradingTime: isTradingTime(),
             serverTime: new Date().toISOString(),
             llmConfigured: isLlmConfigured(),
         },
+    }),
+
+    /** AI 助手会话列表（按最近更新降序，v1.5.0） */
+    '/api/agent/sessions': async () => ({
+        data: { list: await listSessions() },
+        meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false },
+    }),
+
+    /** AI 助手元信息：系统提示词全文 + 工具清单（v1.5.0，可观测性） */
+    '/api/agent/meta': async () => ({
+        data: getAgentMeta(),
+        meta: { source: 'agent', fetchedAt: new Date().toISOString(), fromCache: false },
     }),
 
     /**
@@ -475,11 +557,13 @@ const routes = {
         return { data: result.value.stocks, meta: metaOf(result, { bk }) };
     },
 
-    /** 涨停池（同花顺） */
+    /** 涨停池（同花顺；历史日期归档直读，v1.6.0） */
     '/api/limitup/pool': async (params) => {
         const date = optionalTradeDate(params);
         const result = await getLimitUpPool(date);
-        archive('limitup', date, result.value);
+        if (!result.fromArchive) {
+            archive('limitup', date, result.value);
+        }
         return { data: result.value, meta: metaOf(result) };
     },
 
@@ -493,10 +577,11 @@ const routes = {
     /**
      * 连板天梯：当日涨停池按连板数分层（高度板在前）。
      * 复用涨停池缓存，零新增上游请求；层内按 天数少者优先（N板N天最强）、再按首封时间。
+     * 历史日期归档直读（v1.6.0）：天梯归档缺失时由涨停池派生（池同样先读归档）。
      */
     '/api/ladder': async (params) => {
         const date = optionalTradeDate(params);
-        const result = await cached(`ladder:${date}`, cacheTtl('ladder'), async () => {
+        const result = (await tryArchive('ladder', date)) ?? (await cached(`ladder:${date}`, cacheTtl('ladder'), async () => {
             const poolResult = await getLimitUpPool(date);
             const pool = poolResult.value;
             const tierMap = new Map(); // boards → stocks
@@ -527,8 +612,10 @@ const routes = {
                 maxBoards: tiers[0]?.boards ?? 0,
                 tiers,
             };
-        });
-        archive('ladder', date, result.value);
+        }));
+        if (!result.fromArchive) {
+            archive('ladder', date, result.value);
+        }
         return { data: result.value, meta: metaOf(result) };
     },
 
@@ -583,8 +670,10 @@ const routes = {
                     batch.map(async (d) => {
                         try {
                             return { date: d, pool: (await getLimitUpPool(d)).value };
-                        } catch {
-                            return { date: d, pool: null }; // 单日失败容忍，窗口继续
+                        } catch (error) {
+                            // 单日失败容忍，窗口继续；日志留线索（连续失败多为上游限流，v1.6.1）
+                            console.warn(`[related] 历史涨停池 ${d} 获取失败（跳过该日）: ${error.message}`);
+                            return { date: d, pool: null };
                         }
                     }),
                 );
@@ -647,14 +736,26 @@ const routes = {
     /**
      * 龙虎榜：东财 datacenter（主源，榜单行按代码合并）+ 同花顺（游资/机构净买、标签、概念）合并。
      * 任一平台失败可降级（platforms 标注）；全部失败 502。排序：净买额降序。
+     * 历史日期归档直读（v1.6.0）；空列表（收盘 ~17:00 发布前）不做长缓存。
      */
     '/api/dragon-tiger': async (params) => {
         const date = optionalTradeDate(params);
-        const result = await cached(`dragontiger:${date}`, cacheTtl('dragontiger'), async () => {
+        const result = (await tryArchive('dragontiger', date)) ?? (await cached(
+            `dragontiger:${date}`,
+            // 龙虎榜收盘后约 17:00 才发布：发布前的空列表是中途状态，长缓存会挡住之后发布的真数据（封顶 30min）
+            (value) => (value.list?.length ? cacheTtl('dragontiger') : Math.min(cacheTtl('dragontiger'), 30 * 60 * 1000)),
+            async () => {
             const [east, thsRes] = await Promise.allSettled([
                 eastmoney.fetchDragonTiger(date),
                 ths.fetchDragonTigerList(date),
             ]);
+            // 平台级失败留日志（v1.6.1）：降级仍返回数据，但排查「榜单变少/为空」需要进程日志线索
+            if (east.status === 'rejected') {
+                console.warn(`[dragon-tiger] 东财龙虎榜失败（${date}，降级同花顺）: ${east.reason?.message ?? east.reason}`);
+            }
+            if (thsRes.status === 'rejected') {
+                console.warn(`[dragon-tiger] 同花顺龙虎榜失败（${date}，降级东财）: ${thsRes.reason?.message ?? thsRes.reason}`);
+            }
             if (east.status === 'rejected' && thsRes.status === 'rejected') {
                 throw east.reason ?? thsRes.reason;
             }
@@ -751,8 +852,10 @@ const routes = {
                 platforms,
                 list,
             };
-        });
-        archive('dragontiger', date, result.value);
+        }));
+        if (!result.fromArchive) {
+            archive('dragontiger', date, result.value);
+        }
         return { data: result.value, meta: metaOf(result) };
     },
 
@@ -761,9 +864,42 @@ const routes = {
      * 各平台独立容错（platforms 标注 ok/error），全部失败才 502；
      * 合并行按 code 聚合各平台名次与元数据，默认按东财名次升序（缺失排后）。
      * 淘股吧（tgb.cn）当前网络 DNS 不可达，未接入（见 docs/design.md 已知限制）。
+     * date 参数（v1.6.0，可选）：历史日期仅能由本地归档提供（上游无历史热榜接口），缺失时 404 如实告知。
      */
     '/api/hot-rank': async (params) => {
         const limit = clampInt(params, 'limit', 100, 1, 300);
+        const dateRaw = params.get('date');
+        if (dateRaw !== null && dateRaw !== '') {
+            if (!/^\d{8}$/.test(dateRaw)) {
+                throw new ApiError(400, '参数 date 必须为 yyyyMMdd 格式');
+            }
+            if (dateRaw > todayYyyymmdd()) {
+                throw new ApiError(400, '参数 date 不能晚于今天');
+            }
+        }
+        // 历史日期归档直读：不走上游（无历史接口可查），归档缺失不编造数据
+        if (dateRaw && dateRaw < todayYyyymmdd()) {
+            const record = await loadRecordWithMeta('hotrank', dateRaw);
+            if (!record) {
+                throw new ApiError(404, `${dateRaw} 热榜归档缺失：上游不提供历史热榜接口，归档自功能启用之日起逐日积累（见 docs/design.md D15）`);
+            }
+            return {
+                data: {
+                    platforms: record.data.platforms,
+                    total: record.data.total,
+                    list: record.data.list.slice(0, limit),
+                },
+                meta: {
+                    source: record.data.source ?? 'archive:hotrank',
+                    fetchedAt: new Date().toISOString(),
+                    fromCache: false,
+                    fromArchive: true,
+                    archiveSavedAt: record.savedAt,
+                    limit,
+                    date: dateRaw,
+                },
+            };
+        }
         const result = await cached('hotrank', cacheTtl('hotrank'), async () => {
             const [dfcf, thsRes, clsRes, dzhRes] = await Promise.allSettled([
                 eastmoney.fetchPopularityRank(),
@@ -771,6 +907,12 @@ const routes = {
                 cls.fetchHotRanking(),
                 dzh.fetchHotRanking(),
             ]);
+            // 平台级失败留日志（v1.6.1）：单平台失败仅体现在 meta.platforms，进程日志补充排查线索
+            [['dfcf', dfcf], ['ths', thsRes], ['cls', clsRes], ['dzh', dzhRes]].forEach(([name, settled]) => {
+                if (settled.status === 'rejected') {
+                    console.warn(`[hot-rank] ${name} 平台获取失败（降级合并）: ${settled.reason?.message ?? settled.reason}`);
+                }
+            });
             if ([dfcf, thsRes, clsRes, dzhRes].every((r) => r.status === 'rejected')) {
                 throw dfcf.reason ?? new Error('人气榜全部平台获取失败');
             }
@@ -864,7 +1006,7 @@ const routes = {
             );
             return { source: 'hotrank:dfcf+ths+cls+dzh', platforms, total: list.length, list };
         });
-        // 热榜无日期参数：按抓取日归档（上游不支持历史回补，见 lib/history.js 头注释）
+        // 热榜无上游日期参数：按抓取日归档（上游不支持历史回补，见 lib/history.js 头注释）
         archive('hotrank', todayYyyymmdd(), result.value);
         return {
             data: {
@@ -872,7 +1014,7 @@ const routes = {
                 total: result.value.total,
                 list: result.value.list.slice(0, limit),
             },
-            meta: metaOf(result, { limit }),
+            meta: metaOf(result, { limit, date: todayYyyymmdd() }),
         };
     },
 };
@@ -961,7 +1103,7 @@ export async function collectHistory() {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/agent/chat（AI 选股助手，v1.3.0）
+// POST /api/agent/chat（AI 选股助手，v1.5.0 起为 会话持久化 + SSE 流式）
 // ---------------------------------------------------------------------------
 
 /** 读取 POST JSON 请求体（限 64KB） */
@@ -993,36 +1135,52 @@ function readJsonBody(req, limitBytes = 64 * 1024) {
     });
 }
 
+/** 异常 → {status, message}（已知业务错误用原文，未知错误包一层） */
+function errorStatusOf(error, fallbackPrefix) {
+    const status =
+        error instanceof ApiError ? error.status
+        : error instanceof LlmConfigError ? 503
+        : error instanceof LlmError ? 502
+        : 500;
+    const known = error instanceof ApiError || error instanceof LlmConfigError || error instanceof LlmError;
+    return { status, message: known ? error.message : `${fallbackPrefix}: ${error.message}` };
+}
+
 /**
- * AI 选股助手对话：{ messages } → Agent 工具循环 → { reply, toolTrace, stocks }。
- * LLM 配置缺失 → 503（附配置指引）；LLM 调用失败 → 502。
+ * AI 选股助手对话（SSE 流式，v1.5.0）：
+ * { sessionId, message } → 校验/加载会话历史 → Agent 流式循环 → 事件逐条推送 → 消息与 trace 落库。
+ *
+ * 流开始前（校验/LLM 未配置）错误走 JSON 信封；流开始后错误走 error 事件。
+ * 客户端断开（关闭页面/切走请求）→ AbortController 中止 LLM 流与工具循环，不落半截回答。
+ *
+ * SSE 事件（event: 名 / data: JSON）：
+ * - session      {sessionId, title}                 会话确认（首条消息后 title 已更新）
+ * - round_start  {round}                            第 N 轮 LLM 调用开始
+ * - reasoning    {round, text}                      思考过程增量（逐字）
+ * - content      {round, text}                      正式回答增量（逐字）
+ * - tool_call    {round, index, tool, label, args}  工具即将执行（参数完整）
+ * - tool_result  {round, index, tool, label, status, summary, durationMs} 工具执行完成
+ * - done         {reply, reasoning, toolTrace, stocks, model, llmRounds, truncated, aborted, durationMs, usage, traceId}
+ * - error        {status, message}
  */
-async function handleAgentChat(req) {
+async function handleAgentChat(req, res) {
+    // ---- 阶段一：校验（失败返回 JSON 信封，尚未进入流式） ----
     const body = await readJsonBody(req);
-    // 对话历史上限（条数 / 单条字符数）取自 config.agent，防止 prompt 无限膨胀（可热改，v1.4.0）
     const { maxMessages, maxContent } = getGroup('agent');
-    const rawMessages = body?.messages;
-    if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
-        throw new ApiError(400, '参数 messages 必须为非空数组');
+    const sessionId = typeof body?.sessionId === 'string' ? body.sessionId.trim() : '';
+    const message = typeof body?.message === 'string' ? body.message.trim() : '';
+    if (!sessionId) {
+        throw new ApiError(400, '参数 sessionId 必填（先 POST /api/agent/sessions 创建会话）');
     }
-    if (rawMessages.length > maxMessages) {
-        throw new ApiError(400, `messages 最多 ${maxMessages} 条（请在前端截断更早的历史）`);
+    if (!message) {
+        throw new ApiError(400, '参数 message 必须为非空字符串');
     }
-    const history = [];
-    for (const item of rawMessages) {
-        if (!item || typeof item !== 'object' || !['user', 'assistant'].includes(item.role)) {
-            throw new ApiError(400, 'messages 元素必须为 { role: "user"|"assistant", content: string }');
-        }
-        if (typeof item.content !== 'string' || !item.content.trim()) {
-            throw new ApiError(400, 'messages.content 必须为非空字符串');
-        }
-        if (item.content.length > maxContent) {
-            throw new ApiError(400, `messages.content 单条不超过 ${maxContent} 字符`);
-        }
-        history.push({ role: item.role, content: item.content.trim() });
+    if (message.length > maxContent) {
+        throw new ApiError(400, `message 单条不超过 ${maxContent} 字符`);
     }
-    if (history[history.length - 1].role !== 'user') {
-        throw new ApiError(400, 'messages 最后一条必须是 user 消息');
+    const session = await getSession(sessionId);
+    if (!session) {
+        throw new ApiError(404, `会话不存在或已删除: ${sessionId}`);
     }
     if (!isLlmConfigured()) {
         throw new LlmConfigError(
@@ -1030,18 +1188,159 @@ async function handleAgentChat(req) {
         );
     }
 
-    const result = await runAgent(history, invokeRoute);
-    return {
-        data: {
+    // 历史加载：最近 maxMessages-1 条 + 本条 user（服务端为唯一真相源，前端不再携带历史）
+    const stored = await listMessages(sessionId, maxMessages - 1);
+    const history = stored
+        .filter((item) => ['user', 'assistant'].includes(item.role) && item.content?.trim())
+        .map((item) => ({ role: item.role, content: item.content }));
+    history.push({ role: 'user', content: message });
+
+    // 用户消息即时落库；首条消息用其内容作为会话标题（截 30 字）
+    await appendMessage(sessionId, { role: 'user', content: message });
+    let title = session.title;
+    if (!title || title === '新会话') {
+        title = message.slice(0, 30);
+        await updateSessionTitle(sessionId, title);
+    }
+
+    // ---- 阶段二：SSE 流式（此后错误走 error 事件） ----
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no', // 反代（nginx 等）关闭缓冲，保证逐字推送
+    });
+    const send = (event, data) => {
+        if (!res.writableEnded && !res.destroyed) {
+            res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        }
+    };
+    send('session', { sessionId, title });
+
+    const controller = new AbortController();
+    // 客户端断开检测：req 的 'close' 在请求体读完后即触发（Node ≥18 语义），不可用；
+    // res 的 'close' 才对应底层连接终止（正常 res.end() 后也会触发，用 writableEnded 区分）
+    const onClose = () => {
+        if (!res.writableEnded) {
+            controller.abort();
+        }
+    };
+    res.on('close', onClose);
+
+    try {
+        const result = await runAgent(history, invokeRoute, (event) => send(event.type, event), {
+            signal: controller.signal,
+        });
+
+        // 落库：trace（完整调用链路）+ 助手消息（客户端中止时不落半截回答）
+        let traceId = null;
+        if (!result.aborted) {
+            traceId = await saveTrace({
+                sessionId,
+                model: result.model,
+                llmRounds: result.llmRounds,
+                truncated: result.truncated,
+                durationMs: result.durationMs,
+                usage: result.usage,
+                rounds: result.rounds,
+            });
+            await appendMessage(sessionId, {
+                role: 'assistant',
+                content: result.reply,
+                reasoning: result.reasoning,
+                toolTrace: result.toolTrace,
+                stocks: result.stocks,
+                traceId,
+            });
+        }
+        // done 事件不带 rounds（体积大）：完整调用链路由前端按 traceId 走 GET /api/agent/traces/{id} 拉取
+        send('done', {
             reply: result.reply,
+            reasoning: result.reasoning,
             toolTrace: result.toolTrace,
             stocks: result.stocks,
             model: result.model,
             llmRounds: result.llmRounds,
             truncated: result.truncated,
-        },
-        meta: { source: `llm:${result.model}`, fetchedAt: new Date().toISOString(), fromCache: false },
+            aborted: result.aborted,
+            durationMs: result.durationMs,
+            usage: result.usage,
+            traceId,
+        });
+    } catch (error) {
+        const { status, message: errorMessage } = errorStatusOf(error, 'Agent 执行失败');
+        if (status >= 500) {
+            console.error('[api] /api/agent/chat 流式执行失败:', error);
+        }
+        send('error', { status, message: errorMessage });
+    } finally {
+        res.removeListener('close', onClose);
+        if (!res.writableEnded) {
+            res.end();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 会话 CRUD 与 trace 查询（v1.5.0）
+// ---------------------------------------------------------------------------
+
+/** POST /api/agent/sessions：新建会话（可选 body.title） */
+async function handleCreateSession(req) {
+    const body = await readJsonBody(req).catch(() => null);
+    const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 60) : '';
+    const session = await createSession(title);
+    return { data: session, meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false } };
+}
+
+/** GET /api/agent/sessions/{id}：会话详情 + 全量消息 */
+async function handleGetSession(sessionId) {
+    const session = await getSession(sessionId);
+    if (!session) {
+        throw new ApiError(404, `会话不存在: ${sessionId}`);
+    }
+    const messages = await listMessages(sessionId);
+    return {
+        data: { ...session, messages },
+        meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false },
     };
+}
+
+/** PUT /api/agent/sessions/{id}：重命名会话（body.title 必填） */
+async function handleRenameSession(req, sessionId) {
+    const session = await getSession(sessionId);
+    if (!session) {
+        throw new ApiError(404, `会话不存在: ${sessionId}`);
+    }
+    const body = await readJsonBody(req);
+    const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 60) : '';
+    if (!title) {
+        throw new ApiError(400, '参数 title 必须为非空字符串（≤60 字符）');
+    }
+    await updateSessionTitle(sessionId, title);
+    return {
+        data: await getSession(sessionId),
+        meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false },
+    };
+}
+
+/** DELETE /api/agent/sessions/{id}：删除会话（连带消息与 trace） */
+async function handleDeleteSession(sessionId) {
+    const session = await getSession(sessionId);
+    if (!session) {
+        throw new ApiError(404, `会话不存在: ${sessionId}`);
+    }
+    await deleteSession(sessionId);
+    return { data: { deleted: sessionId }, meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false } };
+}
+
+/** GET /api/agent/traces/{id}：单条调用链路 trace（可观测看板数据源） */
+async function handleGetTrace(traceId) {
+    const trace = await getTrace(traceId);
+    if (!trace) {
+        throw new ApiError(404, `调用链路不存在: ${traceId}`);
+    }
+    return { data: trace, meta: { source: 'chat-store', fetchedAt: new Date().toISOString(), fromCache: false } };
 }
 
 /**
@@ -1053,22 +1352,68 @@ async function handleAgentChat(req) {
  * @returns {Promise<boolean>} 是否命中 API 路由
  */
 export async function handleApiRequest(req, res, url) {
-    // POST 目前仅 /api/agent/chat（Agent 对话需请求体，不走查询串路由表）
+    // POST /api/agent/chat：SSE 流式对话（校验失败 JSON 信封，流内错误 error 事件，处理器内部收尾）
     if (req.method === 'POST' && url.pathname === '/api/agent/chat') {
         try {
-            const { data, meta } = await handleAgentChat(req);
-            sendJson(res, 200, { data, meta });
+            await handleAgentChat(req, res);
         } catch (error) {
-            const status =
-                error instanceof ApiError ? error.status
-                : error instanceof LlmConfigError ? 503
-                : error instanceof LlmError ? 502
-                : 500;
-            const known = error instanceof ApiError || error instanceof LlmConfigError || error instanceof LlmError;
-            const message = known ? error.message : `Agent 执行失败: ${error.message}`;
+            // 仅流开始前的校验错误会走到这里（流内错误已由 error 事件送出）
+            const { status, message } = errorStatusOf(error, 'Agent 执行失败');
             if (status >= 500) {
                 console.error('[api] /api/agent/chat 失败:', error);
             }
+            sendJson(res, status, { error: { status, message } });
+        }
+        return true;
+    }
+
+    // POST /api/agent/sessions：新建会话
+    if (req.method === 'POST' && url.pathname === '/api/agent/sessions') {
+        try {
+            const { data, meta } = await handleCreateSession(req);
+            sendJson(res, 200, { data, meta });
+        } catch (error) {
+            const { status, message } = errorStatusOf(error, '会话创建失败');
+            sendJson(res, status, { error: { status, message } });
+        }
+        return true;
+    }
+
+    // /api/agent/sessions/{id}：GET 详情 / PUT 重命名 / DELETE 删除
+    const sessionMatch = url.pathname.match(/^\/api\/agent\/sessions\/([\w-]+)$/);
+    if (sessionMatch) {
+        const sessionId = sessionMatch[1];
+        try {
+            let result;
+            if (req.method === 'GET') {
+                result = await handleGetSession(sessionId);
+            } else if (req.method === 'PUT') {
+                result = await handleRenameSession(req, sessionId);
+            } else if (req.method === 'DELETE') {
+                result = await handleDeleteSession(sessionId);
+            } else {
+                sendJson(res, 405, { error: { status: 405, message: '仅支持 GET / PUT / DELETE' } });
+                return true;
+            }
+            sendJson(res, 200, result);
+        } catch (error) {
+            const { status, message } = errorStatusOf(error, '会话操作失败');
+            sendJson(res, status, { error: { status, message } });
+        }
+        return true;
+    }
+
+    // /api/agent/traces/{id}：GET 调用链路 trace
+    const traceMatch = url.pathname.match(/^\/api\/agent\/traces\/([\w-]+)$/);
+    if (traceMatch) {
+        if (req.method !== 'GET') {
+            sendJson(res, 405, { error: { status: 405, message: '仅支持 GET' } });
+            return true;
+        }
+        try {
+            sendJson(res, 200, await handleGetTrace(traceMatch[1]));
+        } catch (error) {
+            const { status, message } = errorStatusOf(error, 'trace 查询失败');
             sendJson(res, status, { error: { status, message } });
         }
         return true;

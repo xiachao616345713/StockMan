@@ -400,7 +400,7 @@ onUnmounted(() => {
                 <div class="panel-title">
                     <h2>
                         缓存 TTL
-                        <span class="sub">各接口按交易时段选择的缓存时长（秒），范围 5–7200</span>
+                        <span class="sub">各接口按交易时段选择的缓存时长（秒）：交易 5–7200 / 收盘 5–86400；收盘缓存最晚在下一交易日开盘时失效</span>
                     </h2>
                 </div>
                 <div class="table-wrap">
@@ -436,7 +436,7 @@ onUnmounted(() => {
                                         class="input num-input"
                                         type="number"
                                         min="5"
-                                        max="7200"
+                                        max="86400"
                                     >
                                 </td>
                             </tr>
@@ -493,7 +493,7 @@ onUnmounted(() => {
                 <div class="panel-title">
                     <h2>
                         上游 HTTP
-                        <span class="sub">行情上游请求的超时与重试（对全部数据源均匀生效）</span>
+                        <span class="sub">行情上游请求的超时、重试与调用频率限制（对全部数据源均匀生效）</span>
                     </h2>
                 </div>
                 <div class="field-grid">
@@ -529,7 +529,33 @@ onUnmounted(() => {
                             step="50"
                         >
                     </label>
+                    <label class="field">
+                        <span class="field-name">最小请求间隔 (毫秒)</span>
+                        <input
+                            v-model.number="form.http.minIntervalMs"
+                            class="input num-input"
+                            type="number"
+                            min="0"
+                            max="10000"
+                            step="10"
+                        >
+                    </label>
+                    <label class="field">
+                        <span class="field-name">单主机最大并发</span>
+                        <input
+                            v-model.number="form.http.maxConcurrent"
+                            class="input num-input"
+                            type="number"
+                            min="1"
+                            max="32"
+                        >
+                    </label>
                 </div>
+                <p class="hint">
+                    频率限制按「上游主机」维度生效：同一主机相邻两次请求的启动间隔不低于「最小请求间隔」，
+                    同时在途请求数不超过「单主机最大并发」。上游出现空数据/拒绝连接（疑似限流）时可适当调大间隔、调小并发；
+                    调大后全市场快照刷新会变慢（约 60 页分页拉取），请结合快照缓存 TTL 权衡。
+                </p>
             </section>
         </template>
     </div>

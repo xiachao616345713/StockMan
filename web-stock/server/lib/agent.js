@@ -8,7 +8,7 @@
  * 依赖注入而非直接 import api.js：避免 api.js ↔ agent.js 的 ESM 循环引用。
  */
 
-import { chatCompletions, getLlmConfig } from './llm.js';
+import { chatCompletionsStream, getLlmConfig } from './llm.js';
 import { getGroup } from './config.js';
 import { archiveOverview, loadRecord, recentCalendarDates, recentWeekdayDates } from './history.js';
 
@@ -144,10 +144,15 @@ const TOOL_DEFS = [
         type: 'function',
         function: {
             name: 'get_hot_rank',
-            description: '人气热榜：东财/同花顺/财联社/大智慧四平台合并的个股人气排行（各平台名次/人气标签/概念），问「热门股/人气/关注度」时使用。',
+            description:
+                '人气热榜：东财/同花顺/财联社/大智慧四平台合并的个股人气排行（各平台名次/人气标签/概念），问「热门股/人气/关注度」时使用。' +
+                '传 date 可查历史日期（由本地归档直读；上游无历史热榜接口，归档自系统启用日起积累，缺失会报错，届时如实告知覆盖范围）。',
             parameters: {
                 type: 'object',
-                properties: { limit: { type: 'integer', description: '条数 1–300，默认 20' } },
+                properties: {
+                    limit: { type: 'integer', description: '条数 1–300，默认 20' },
+                    date: { type: 'string', description: '交易日 yyyyMMdd，缺省为今天；历史日期仅能由本地归档提供' },
+                },
             },
         },
     },
@@ -538,7 +543,14 @@ async function execHistoryCoLimitup(args, invoke) {
     for (let start = 0; start < missing.length; start += 5) {
         const batch = missing.slice(start, start + 5);
         const settled = await Promise.allSettled(batch.map((date) => invoke('/api/limitup/pool', { date })));
-        backfilled += settled.filter((r) => r.status === 'fulfilled').length;
+        settled.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                backfilled += 1;
+            } else {
+                // 回补失败容忍（窗口继续），但须留日志：连续失败多为上游限流（v1.6.1）
+                console.warn(`[agent] 涨停池归档回补失败 ${batch[index]}: ${result.reason?.message ?? result.reason}`);
+            }
+        });
     }
 
     // 统计：目标涨停日 + 同日的其他涨停股
@@ -611,55 +623,234 @@ async function execHistoryTool(name, args, invoke) {
 }
 
 // ---------------------------------------------------------------------------
-// Agent 主循环
+// Agent 元信息（系统提示词 + 工具清单，GET /api/agent/meta 数据源）
 // ---------------------------------------------------------------------------
 
 /**
- * 执行 Agent：LLM function-calling 循环直至产出最终回答
+ * Agent 元信息：当前系统提示词全文 + 全部工具定义（含中文 label 与参数 schema）。
+ * 前端「系统提示词与工具」查看入口的数据源（v1.5.0）。
+ *
+ * @returns {{systemPrompt: string, maxRounds: number, tools: Array<{name: string, label: string, description: string, parameters: object}>}}
+ */
+export function getAgentMeta() {
+    const labelOf = (name) => TOOL_ROUTES[name]?.label ?? HISTORY_TOOLS[name]?.label ?? name;
+    return {
+        systemPrompt: buildSystemPrompt(),
+        maxRounds: getGroup('agent').maxRounds,
+        tools: TOOL_DEFS.map((def) => ({
+            name: def.function.name,
+            label: labelOf(def.function.name),
+            kind: Object.prototype.hasOwnProperty.call(HISTORY_TOOLS, def.function.name) ? 'history' : 'data',
+            description: def.function.description,
+            parameters: def.function.parameters,
+        })),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Agent 主循环（事件驱动 + 全链路 trace，v1.5.0）
+// ---------------------------------------------------------------------------
+
+/** 单个工具调用回填给 LLM 的结果预览截断长度（trace 看板展示用） */
+const RESULT_PREVIEW_LIMIT = 1500;
+
+/**
+ * 空响应时给用户的明确提示（v1.6.2）：按上游 finish_reason 区分原因。
+ * length=token 预算耗尽（推理模型思考过程占用 maxTokens 最常见）、content_filter=审查拦截、
+ * 其余为上游异常（限流/端点故障等），提示对应可执行动作而非笼统「请重试」。
+ *
+ * @param {string|null} finishReason 上游 choices[0].finish_reason
+ * @returns {string} 用户可读的失败说明
+ */
+function emptyReplyMessage(finishReason) {
+    if (finishReason === 'length') {
+        return '（本次回答失败：模型的思考+输出用尽了 maxTokens 上限，正式回答未生成。' +
+            '请在「设置 → AI 模型」调大 maxTokens（推理模型建议 ≥8192），或简化问题后重试）';
+    }
+    if (finishReason === 'content_filter') {
+        return '（本次回答被上游内容审查拦截，未返回任何内容。请调整问法后重试）';
+    }
+    return '（模型未返回内容，可能是上游限流或服务异常，请稍后重试；持续失败请查看服务端日志 [llm]/[agent] 告警）';
+}
+
+/**
+ * 执行 Agent：LLM function-calling 流式循环直至产出最终回答。
+ *
+ * 全过程通过 emit 回调推送事件（api.js 转发为 SSE）：
+ * - {type:'round_start', round}                                        每轮 LLM 调用开始
+ * - {type:'reasoning', round, text}                                    思考过程增量（逐字）
+ * - {type:'content', round, text}                                      正式回答增量（逐字）
+ * - {type:'tool_call', round, index, tool, label, args}                工具即将执行（参数已聚合完整）
+ * - {type:'tool_result', round, index, tool, label, status, summary, durationMs}  工具执行完成
+ *
+ * 同时构建完整 trace（调用链路看板数据源）：每轮 LLM 的 输入消息数/思考/输出/tool_calls、
+ * 每个工具的 参数/状态/摘要/耗时/结果预览、每轮与总体的 tokens 与耗时。
  *
  * @param {Array<{role: 'user'|'assistant', content: string}>} history 对话历史（最后一条须为 user，调用方已校验）
  * @param {(pathname: string, params: Record<string, any>) => Promise<{data: any, meta?: object}>} invoke 内部路由转发（api.js#invokeRoute）
- * @returns {Promise<{reply: string, toolTrace: Array<object>, stocks: Array<object>, model: string, llmRounds: number, truncated: boolean}>}
+ * @param {(event: object) => void} [emit] 增量事件回调（缺省静默）
+ * @param {{signal?: AbortSignal}} [options] signal：客户端断开时中止 LLM 流与工具循环
+ * @returns {Promise<{reply: string, reasoning: string|null, toolTrace: Array<object>, stocks: Array<object>,
+ *                    model: string, llmRounds: number, truncated: boolean, durationMs: number,
+ *                    usage: object|null, rounds: Array<object>, aborted: boolean}>}
  */
-export async function runAgent(history, invoke) {
+export async function runAgent(history, invoke, emit = () => {}, options = {}) {
     const config = getLlmConfig();
     // LLM 最大交互轮数（防工具死循环；正常问题 1–3 轮）。取自 config.agent.maxRounds，可热改（v1.4.0）。
     const maxRounds = getGroup('agent').maxRounds;
+    const startedAt = Date.now();
     const messages = [{ role: 'system', content: buildSystemPrompt() }, ...history];
     const toolTrace = [];
     const stockSink = new Map();
+    /** @type {Array<object>} trace.rounds：每轮 LLM 交互与工具执行的完整记录 */
+    const rounds = [];
+    const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    let hasUsage = false;
     let llmRounds = 0;
+    const isAborted = () => Boolean(options.signal?.aborted);
+    const safeEmit = (event) => {
+        try {
+            emit(event);
+        } catch {
+            // 推送失败（如连接已断）不影响 Agent 循环
+        }
+    };
+
+    /** 累计单轮 usage 到总量（缺失字段按 0 处理） */
+    const accumulateUsage = (usage) => {
+        if (!usage) {
+            return;
+        }
+        hasUsage = true;
+        totalUsage.promptTokens += usage.promptTokens ?? 0;
+        totalUsage.completionTokens += usage.completionTokens ?? 0;
+        totalUsage.totalTokens += usage.totalTokens ?? 0;
+    };
+
+    const finish = ({ reply, truncated, aborted, reasoningText }) => ({
+        reply,
+        reasoning: reasoningText || null,
+        toolTrace,
+        stocks: [...stockSink.values()],
+        model: config.model,
+        llmRounds,
+        truncated,
+        aborted,
+        durationMs: Date.now() - startedAt,
+        usage: hasUsage ? totalUsage : null,
+        rounds,
+    });
+
+    const allReasoning = [];
 
     for (let round = 0; round < maxRounds; round += 1) {
-        const reply = await chatCompletions({ messages, tools: TOOL_DEFS });
+        if (isAborted()) {
+            return finish({
+                reply: '（请求已中止）',
+                truncated: false,
+                aborted: true,
+                reasoningText: allReasoning.join('\n'),
+            });
+        }
+        const roundRecord = {
+            round: round + 1,
+            inputMessages: messages.length,
+            reasoning: null,
+            content: null,
+            usage: null,
+            finishReason: null,
+            durationMs: 0,
+            toolCalls: [],
+        };
+        rounds.push(roundRecord);
+        safeEmit({ type: 'round_start', round: round + 1 });
+
+        const roundStarted = Date.now();
+        const reply = await chatCompletionsStream({
+            messages,
+            tools: TOOL_DEFS,
+            signal: options.signal,
+            onDelta: (event) => {
+                safeEmit({ ...event, round: round + 1 });
+            },
+        });
+        roundRecord.durationMs = Date.now() - roundStarted;
+        roundRecord.reasoning = reply.reasoning;
+        roundRecord.content = reply.content || null;
+        roundRecord.usage = reply.usage;
+        roundRecord.finishReason = reply.finishReason ?? null;
+        accumulateUsage(reply.usage);
+        if (reply.reasoning) {
+            allReasoning.push(reply.reasoning);
+        }
         llmRounds += 1;
-        messages.push(reply);
+        // 回填给 LLM 的 assistant 消息只保留协议字段（reasoning 仅本地展示/落库，不回传上游）
+        messages.push({
+            role: 'assistant',
+            content: reply.content ?? '',
+            ...(reply.tool_calls ? { tool_calls: reply.tool_calls } : {}),
+        });
 
         const calls = reply.tool_calls ?? [];
         if (calls.length === 0) {
-            return {
-                reply: (reply.content ?? '').trim() || '（模型未返回内容，请重试或换个问法）',
-                toolTrace,
-                stocks: [...stockSink.values()],
-                model: config.model,
-                llmRounds,
+            const finalReply = (reply.content ?? '').trim();
+            if (!finalReply) {
+                // 「返回空」排查锚点（v1.6.1，v1.6.2 增加 finish_reason 区分截断原因）：
+                // length=token 预算耗尽（推理模型思考过程占用配额最常见）、content_filter=上游审查、
+                // 其余（stop/null）多为上游限流或端点异常；llm.js 同轮还有更底层日志
+                console.warn(
+                    `[agent] LLM 第 ${round + 1} 轮返回空内容（无 content 且无 tool_calls）: model=${config.model}` +
+                    ` finish_reason=${reply.finishReason ?? 'null'} maxTokens=${getGroup('llm').maxTokens}` +
+                    ` durationMs=${Date.now() - roundStarted} usage=${JSON.stringify(reply.usage ?? null)}`,
+                );
+            }
+            return finish({
+                reply: finalReply || emptyReplyMessage(reply.finishReason),
                 truncated: false,
-            };
+                aborted: false,
+                reasoningText: allReasoning.join('\n'),
+            });
         }
 
-        for (const call of calls) {
+        for (let callIndex = 0; callIndex < calls.length; callIndex += 1) {
+            const call = calls[callIndex];
+            if (isAborted()) {
+                return finish({
+                    reply: '（请求已中止）',
+                    truncated: false,
+                    aborted: true,
+                    reasoningText: allReasoning.join('\n'),
+                });
+            }
             const name = call?.function?.name ?? '';
             const route = TOOL_ROUTES[name];
             const isHistory = Object.prototype.hasOwnProperty.call(HISTORY_TOOLS, name);
-            const trace = { tool: name, label: route?.label ?? HISTORY_TOOLS[name]?.label ?? name, args: {}, status: 'ok', summary: '' };
+            const trace = {
+                tool: name,
+                label: route?.label ?? HISTORY_TOOLS[name]?.label ?? name,
+                round: round + 1,
+                args: {},
+                status: 'ok',
+                summary: '',
+                durationMs: 0,
+            };
+            /** trace 看板的工具执行记录（含结果预览） */
+            const callRecord = { tool: name, label: trace.label, args: {}, status: 'ok', summary: '', durationMs: 0, resultPreview: null };
+            roundRecord.toolCalls.push(callRecord);
 
             let args = null;
             try {
                 args = call?.function?.arguments ? JSON.parse(call.function.arguments) : {};
                 trace.args = args;
+                callRecord.args = args;
             } catch {
                 trace.args = { raw: String(call?.function?.arguments ?? '').slice(0, 200) }; // 参数 JSON 非法
+                callRecord.args = trace.args;
             }
+
+            // 先推送「即将调用」（前端可实时看到工具选择与参数），再执行
+            safeEmit({ type: 'tool_call', round: round + 1, index: callIndex, tool: name, label: trace.label, args: trace.args });
+            const toolStarted = Date.now();
 
             let payload;
             if (!route && !isHistory) {
@@ -678,11 +869,13 @@ export async function runAgent(history, invoke) {
                     trace.summary = summarizeTool(name, payload);
                     if (payload?.error) {
                         trace.status = 'error';
+                        console.warn(`[agent] 工具 ${name} 返回错误（第 ${round + 1} 轮）: ${payload.error}`);
                     }
                 } catch (error) {
                     payload = { error: `工具执行失败: ${error.message}` };
                     trace.status = 'error';
                     trace.summary = String(error.message).slice(0, 60);
+                    console.warn(`[agent] 工具 ${name} 执行异常（第 ${round + 1} 轮）:`, error);
                 }
             } else {
                 try {
@@ -691,13 +884,38 @@ export async function runAgent(history, invoke) {
                     collectStocks(payload, stockSink);
                     trace.summary = summarizeTool(name, payload);
                 } catch (error) {
-                    // 路由层 ApiError（参数校验 400 等）与上游失败（502）均回填给模型自行修正
+                    // 路由层 ApiError（参数校验 400 等）与上游失败（502）均回填给模型自行修正；
+                    // 服务端同步留日志（v1.6.1）：上游限流/空返回等问题在 trace 之外也可从进程日志定位
                     payload = { error: `工具执行失败: ${error.message}` };
                     trace.status = 'error';
                     trace.summary = String(error.message).slice(0, 60);
+                    console.warn(
+                        `[agent] 工具 ${name}(${route.path}) 执行失败（第 ${round + 1} 轮）: ${error.message}` +
+                        ` | args=${JSON.stringify(args).slice(0, 200)}`,
+                    );
                 }
             }
+
+            trace.durationMs = Date.now() - toolStarted;
+            callRecord.status = trace.status;
+            callRecord.summary = trace.summary;
+            callRecord.durationMs = trace.durationMs;
+            try {
+                callRecord.resultPreview = JSON.stringify(payload).slice(0, RESULT_PREVIEW_LIMIT);
+            } catch {
+                callRecord.resultPreview = null;
+            }
             toolTrace.push(trace);
+            safeEmit({
+                type: 'tool_result',
+                round: round + 1,
+                index: callIndex,
+                tool: name,
+                label: trace.label,
+                status: trace.status,
+                summary: trace.summary,
+                durationMs: trace.durationMs,
+            });
             messages.push({
                 role: 'tool',
                 tool_call_id: call?.id ?? `call_${round}_${toolTrace.length}`,
@@ -707,12 +925,11 @@ export async function runAgent(history, invoke) {
     }
 
     // 达到最大轮数模型仍在调工具：返回已收集信息的中断提示
-    return {
+    console.warn(`[agent] 达到最大轮数 ${maxRounds} 仍在调用工具，本次回答被中断（工具调用 ${toolTrace.length} 次）`);
+    return finish({
         reply: '本次问题涉及的数据调用过多，已中止。请把需求说得更具体一些（例如指明板块、涨跌幅区间、换手率等条件）后重试。',
-        toolTrace,
-        stocks: [...stockSink.values()],
-        model: config.model,
-        llmRounds,
         truncated: true,
-    };
+        aborted: false,
+        reasoningText: allReasoning.join('\n'),
+    });
 }

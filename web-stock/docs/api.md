@@ -1,11 +1,11 @@
 # web-stock 后端接口文档
 
-> 版本：v1.4.0 · Base URL：`http://localhost:8787`（端口默认 8787，可在设置页/`PUT /api/config` 修改后**重启生效**；环境变量 `PORT` 优先于配置库）
+> 版本：v1.6.0 · Base URL：`http://localhost:8787`（端口默认 8787，可在设置页/`PUT /api/config` 修改后**重启生效**；环境变量 `PORT` 优先于配置库）
 > 上游接口出处见 [design.md §4 映射表](design.md)；本文档描述**本项目后端自身**暴露的 REST 接口。
 
 ## 通用约定
 
-- 查询接口仅支持 `GET`（例外：`DELETE /api/cache`、`POST /api/agent/chat`、`PUT /api/config`），无需鉴权（含配置接口，见 design.md §6 限制 16）。
+- 查询接口仅支持 `GET`（例外：`DELETE /api/cache`、`POST /api/agent/chat`、`POST /api/agent/sessions`、`PUT·DELETE /api/agent/sessions/{id}`、`PUT /api/config`），无需鉴权（含配置与会话接口，见 design.md §6 限制 16）。
 - **成功响应**（HTTP 200）：
 
 ```json
@@ -19,6 +19,7 @@
 }
 ```
 
+- **例外**：`POST /api/agent/chat` 成功时响应为 **SSE 流**（`Content-Type: text/event-stream`，非 JSON 信封），事件协议见 §18；仅流开始前的校验错误（400/404/413/503）仍返回 JSON 信封。
 - **失败响应**（HTTP 400/404/405/413/502/503）：
 
 ```json
@@ -28,14 +29,15 @@
 | 状态码 | 含义 |
 |--------|------|
 | 400 | 参数/配置校验失败（含 `PUT /api/config` 的非法值与请求体非合法 JSON） |
-| 404 | 资源不存在（如快照中无该股票）/ 未知接口 |
+| 404 | 资源不存在（如快照中无该股票、会话/trace 不存在）/ 未知接口 |
 | 405 | 请求方法不支持 |
-| 413 | 请求体过大（`/api/agent/chat`、`/api/config` 上限 64KB） |
+| 413 | 请求体过大（`/api/agent/chat`、`/api/agent/sessions`、`/api/config` 上限 64KB） |
 | 502 | 上游数据获取失败（含兜底源也失败）/ LLM 服务调用失败 |
 | 503 | LLM 未配置（`/api/agent/chat`，message 附配置指引） |
 
 - 数值字段上游缺失（停牌等）时统一为 `null`；成交量单位为**手**，金额/市值单位为**元**。
-- 缓存策略见 [design.md §5](design.md)；v1.4.0 起各接口 TTL 为 `cache` 配置组默认值，可经 §20 在线调整。
+- **归档直读标记（v1.6.0）**：`meta.fromArchive=true` 表示数据来自本地历史归档（历史日期请求命中，零上游请求，见 design.md D19），`archiveSavedAt` 为归档落盘时间（ISO），此时 `source` 为归档数据自带的原上游标识。
+- 缓存策略见 [design.md §5](design.md)；v1.4.0 起各接口 TTL 为 `cache` 配置组默认值，可经 §20 在线调整；v1.6.0 起收盘 TTL 默认 24h（龙虎榜 1h），**实际过期封顶到下一交易日开盘**。
 
 ---
 
@@ -44,7 +46,7 @@
 无参数。`isTradingTime` 为宽松判断（上海时区周一至五，时段窗口取配置 `server.tradingStart/tradingEnd`，默认 09:15–15:05，不含节假日）；`llmConfigured`（v1.3.0）表示 AI 助手的 LLM 是否已配置（随设置页「AI 模型」组变化，见 §18/§20）。
 
 ```json
-{ "data": { "ok": true, "version": "1.4.0", "isTradingTime": false, "serverTime": "2026-11-11T07:57:52.300Z", "llmConfigured": true } }
+{ "data": { "ok": true, "version": "1.6.0", "isTradingTime": false, "serverTime": "2026-11-11T07:57:52.300Z", "llmConfigured": true } }
 ```
 
 ## 2. 三大指数 `GET /api/indices`
@@ -203,6 +205,7 @@ curl "http://localhost:8787/api/sectors/stocks?bk=BK0482"
 
 字段说明：`highDays` 几天几板（如 `2天2板`） · `limitUpType` 换手板/一字板等 · `openNum` 开板次数（null=未开板） · `orderVolume` 封单量（股） · `circMv` 流通市值（元） · `firstLimitUpTime`/`lastLimitUpTime` 首/末次封板时间（上海时区 HH:mm:ss） · `limitUpSucRate` 封板率。
 非交易日查询返回空 `list`（`summary.tradeStatus` 可判断交易状态）。
+**归档直读（v1.6.0，D19）**：`date` 早于今天时优先读本地归档——命中即返回（`meta.fromArchive=true` + `archiveSavedAt`，零上游请求）；工作日空归档视为未命中回退上游并写穿覆盖（自愈）。
 
 ## 11. 涨停复盘 `GET /api/limitup/replay`
 
@@ -311,12 +314,14 @@ curl "http://localhost:8787/api/screen?peMin=0&peMax=15&pbMin=0&pbMax=1.5&mvMin=
 
 字段说明：金额单位**元**、比率 %；`explanation` 上榜原因（东财同一股票同日多榜单行按代码合并：主行取榜单成交额更大者，原因去重后以「；」连接）；`d1Pct`/`d2Pct`/`d5Pct`/`d10Pct` 为上榜后 1/2/5/10 日涨跌幅（仅历史榜单有值，当日榜为 null）；`hotMoneyNet`/`orgNet`/`limitReason`/`tags`/`concepts` 来自同花顺，该平台不可用时分别为 `null`/`null`/`null`/`[]`/`[]`。
 **降级**：`platforms` 标注各源 `ok`/`error`；单源失败降级为另一源字段（东财失败时同花顺行缺 收盘价/买卖额/次日涨幅 等东财独有字段）；两源全失败 → 502。默认按净买额降序。
+**归档直读（v1.6.0，D19）**：`date` 早于今天时优先读本地归档（同 §10）。当日**空列表不做长缓存**（TTL 封顶 30min）——榜单 17:00 才发布，防止发布前的空结果长时间挡住真数据；收盘 TTL 默认也因此为 1h（非 24h，见 §19）。
 
-## 15. 热榜（多平台人气聚合） `GET /api/hot-rank`（v1.2.0）
+## 15. 热榜（多平台人气聚合） `GET /api/hot-rank`（v1.2.0，v1.6.0 增 date）
 
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `limit` | int | 100 | 返回条数上限，1–300 |
+| `date` | string | 今天（上海时区） | yyyyMMdd，不可晚于今天（v1.6.0）。**历史日期只能由本地归档提供**（上游无历史热榜接口）：归档命中返回 `meta.fromArchive=true`；缺失 → 404（message 说明归档自启用日起积累，不以旧数据冒充） |
 
 四平台合并：东财 xuangu 人气榜 / 同花顺 fuyao 热股榜 / 财联社热股榜 / 大智慧人气榜，按代码聚合成行（淘股吧当前 DNS 不可达未接入，见 design.md §6）。
 
@@ -339,6 +344,12 @@ curl "http://localhost:8787/api/screen?peMin=0&peMax=15&pbMin=0&pbMax=1.5&mvMin=
 ```
 
 字段说明：各平台名次为 `null` 表示该平台未收录此股；`thsRankChange`/`clsRankChange` 为较上期名次变化（负=上升）；`popularityTag`/`analyseTitle`/`concepts` 来自同花顺；`name`/`price`/`pct`/`volumeRatio` 取 dfcf→ths→cls 首个非 null 值。默认按 `dfcfRank` 升序、其次 `thsRank` 升序（缺名次排末尾）。各平台独立容错（`platforms` 标注 `ok`/`error`/`count`），全部失败才 502。
+`meta.date` 为数据对应日期（实时路径 = 今天；归档直读 = 请求的 `date`）；`meta.limit` 回显生效条数。实时数据按抓取日归档（收盘后即当日终态，历史 `date` 查询由此积累）。
+
+```bash
+# 历史日期（归档直读，缺失时 404）
+curl "http://localhost:8787/api/hot-rank?date=20261111&limit=50"
+```
 
 ## 16. 连板天梯 `GET /api/ladder`（v1.2.0）
 
@@ -364,6 +375,7 @@ curl "http://localhost:8787/api/screen?peMin=0&peMax=15&pbMin=0&pbMax=1.5&mvMin=
 ```
 
 层序按板数降序（最高板在前）；层内按 `ladderDays`（几天几板中的天数）升序（N 板 N 天最强）、再按首封时间升序。`stocks` 元素为 §10 涨停池字段附加 `ladderDays`（由 `highDays` 解码，解码失败按首板）。
+**归档直读（v1.6.0，D19）**：`date` 早于今天时优先读天梯归档；天梯归档缺失但涨停池归档存在时，由池归档派生（仍零上游请求）。
 
 ## 17. 涨停关联分析 `GET /api/limitup/related`（v1.2.0）
 
@@ -397,9 +409,9 @@ curl "http://localhost:8787/api/screen?peMin=0&peMax=15&pbMin=0&pbMax=1.5&mvMin=
 
 字段说明：`themes` 为 `null` 表示涨停复盘获取失败（题材关联缺失，共同涨停不受影响）；复盘仅 top 20 题材组，未入组股票 `themes` 为 `[]`；`targetLimitUpDays` 含当前查询日；`coLimit.dates` 降序，整体按 `count` 降序、`inTodayPool` 降序排列；`inTodayPool` 表示是否也在查询日涨停池。首次查询需回看历史池（≈`days` 次池请求，均走缓存键 `limitup:pool:{date}`）。
 
-## 18. AI 选股助手对话 `POST /api/agent/chat`（v1.3.0）
+## 18. AI 选股助手对话 `POST /api/agent/chat`（v1.3.0，v1.5.0 改 SSE 流式）
 
-LLM function-calling Agent：模型根据自然语言请求调用本服务既有数据接口（复用 §1–§17 的路由与缓存，见 design.md D14），最终返回中文回答 + 工具调用轨迹 + 可点击股票列表。
+LLM function-calling Agent：模型根据自然语言请求调用本服务既有数据接口（复用 §1–§17 的路由与缓存，见 design.md D14）。v1.5.0 起响应为 **SSE 流式**：思考过程与回答逐字推送、工具调用进度实时可见；对话历史由服务端从会话库加载（§21，design.md D17），**前端只传本条消息、不再携带历史**。
 
 **LLM 配置**（v1.4.0 起存配置库，经 §19/§20 读写；token 只存服务端、GET 不回显）：推荐在设置页「AI 模型」组填写 `modelUrl`（base 或完整 chat/completions 地址均可）/ `accessToken` / `model`，保存即生效。环境变量（`LLM_MODEL_URL`/`LLM_ACCESS_TOKEN`/`LLM_MODEL`）与 `server/llm.config.json` 仅在**首次运行（配置库无 llm 组）时作为种子**写入数据库，此后数据库为唯一真相源（见 design.md D16）。
 
@@ -407,48 +419,74 @@ LLM function-calling Agent：模型根据自然语言请求调用本服务既有
 
 | 字段 | 类型 | 约束 | 说明 |
 |------|------|------|------|
-| `messages` | array | 条数 ≤ `agent.maxMessages`（默认 30），最后一条须为 user | 对话历史，元素 `{role: "user"\|"assistant", content: string}`，单条 ≤ `agent.maxContent` 字符（默认 4000）；多轮对话由前端携带历史（服务端无会话状态）；上限可在设置页调整（§20） |
+| `sessionId` | string | 必填，须为已存在会话 | 会话 id，先经 `POST /api/agent/sessions` 创建（§21） |
+| `message` | string | 非空，≤ `agent.maxContent` 字符（默认 4000） | 本条用户消息；发送后立即落库 |
+
+历史上下文：服务端自动加载该会话最近 `agent.maxMessages - 1` 条（默认 29）user/assistant 消息，上限可在设置页调整（§20）。首条消息会自动以内容前 30 字作会话标题。
 
 ```bash
-curl -X POST http://localhost:8787/api/agent/chat \
+SID=$(curl -s -X POST http://localhost:8787/api/agent/sessions -H 'Content-Type: application/json' -d '{}' \
+  | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+curl -N -X POST http://localhost:8787/api/agent/chat \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"帮我筛选涨幅超过5%、换手率大于10%的创业板股票"}]}'
+  -d "{\"sessionId\":\"$SID\",\"message\":\"帮我筛选涨幅超过5%、换手率大于10%的创业板股票\"}"
 ```
 
-**成功响应**：
+**成功响应**：`Content-Type: text/event-stream; charset=utf-8`（另带 `Cache-Control: no-store`、`Connection: keep-alive`、`X-Accel-Buffering: no`）。每帧格式 `event: 名称\ndata: JSON\n\n`，共 8 类事件（按典型时序）：
+
+| 事件 | data | 说明 |
+|------|------|------|
+| `session` | `{sessionId, title}` | 流开始首帧，会话确认（title 为自动命名后的最新标题） |
+| `round_start` | `{round}` | 第 N 轮 LLM 调用开始（1 起） |
+| `reasoning` | `{round, text}` | 思考过程增量（模型 `reasoning_content`，逐字推送；模型不支持则无此事件） |
+| `content` | `{round, text}` | 正式回答增量（逐字推送） |
+| `tool_call` | `{round, index, tool, label, args}` | 工具即将执行，`args` 为完整参数对象 |
+| `tool_result` | `{round, index, tool, label, status, summary, durationMs}` | 工具执行完成，`status ∈ ok/error` |
+| `done` | 见下 | 全部结束汇总，之后服务端关闭流 |
+| `error` | `{status, message}` | 流内执行失败（HTTP 状态码仍为 200，以此事件表达错误） |
+
+`done` 事件 data：
 
 ```json
 {
-  "data": {
-    "reply": "已按「创业板、涨幅≥5%、换手率≥10%」筛选，共命中 12 只：\n1. 300xxx xxx …\n数据仅供参考，不构成投资建议。",
-    "toolTrace": [
-      { "tool": "screen_stocks", "label": "条件选股",
-        "args": { "pctMin": 5, "turnoverMin": 10, "boards": ["创业板"], "sort": "pct", "dir": "desc", "limit": 10 },
-        "status": "ok", "summary": "命中 12 只" }
-    ],
-    "stocks": [ { "code": "300xxx", "name": "xxx", "price": 12.34, "pct": 7.89 } ],
-    "model": "model-name", "llmRounds": 2, "truncated": false
-  },
-  "meta": { "source": "llm:model-name", "fetchedAt": "…", "fromCache": false }
+  "reply": "已按「创业板、涨幅≥5%、换手率≥10%」筛选，共命中 12 只：\n1. 300xxx xxx …\n数据仅供参考，不构成投资建议。",
+  "reasoning": "全部轮次思考过程拼接（模型未输出思考时为 null）",
+  "toolTrace": [
+    { "tool": "screen_stocks", "label": "条件选股", "round": 1,
+      "args": { "pctMin": 5, "turnoverMin": 10, "boards": ["创业板"], "sort": "pct", "dir": "desc", "limit": 10 },
+      "status": "ok", "summary": "命中 12 只", "durationMs": 850 }
+  ],
+  "stocks": [ { "code": "300xxx", "name": "xxx", "price": 12.34, "pct": 7.89 } ],
+  "model": "model-name", "llmRounds": 2, "truncated": false, "aborted": false,
+  "durationMs": 8300,
+  "usage": { "promptTokens": 1200, "completionTokens": 88, "totalTokens": 1288 },
+  "traceId": "9f8a…-uuid"
 }
 ```
 
 字段说明：
-- `toolTrace`：Agent 每次工具调用的轨迹（`status: "ok"|"error"`，`summary` 为一句话摘要），前端渲染为气泡内标签。
+- `toolTrace`：Agent 每次工具调用的轨迹（v1.5.0 附 `round`/`durationMs`），前端渲染为气泡内标签。
 - `stocks`：从工具结果收集的 A 股（≤60 只，板块 BK 代码与指数自动排除），前端渲染为可点击 chips 跳个股页。
 - `llmRounds`：本次对话的 LLM 交互轮数；`truncated: true` 表示达到最大轮数（`agent.maxRounds`，默认 6）仍未收敛，`reply` 为中止提示。
-- 可用工具（13 个）：
+- `aborted: true` 表示客户端中止（见下），此时 `reply` 为中止提示，**assistant 消息与 trace 不落库**（user 消息已落库）。
+- `usage`：本次全部轮次 token 累计；上游流式响应未返回 usage 时为 `null`。
+- `traceId`：调用链路看板入参（§23）；`done` 事件**不含**完整轮次数据（体积大），看板按 traceId 拉取。
+- **客户端中止**：直接断开连接即可（前端「停止生成」按钮 abort fetch）——服务端检测到连接关闭后中止 LLM 流与工具循环，半截回答不落库；已推送内容前端保留展示并标注「已停止」。
+- 可用工具（13 个，完整定义与系统提示词可经 `GET /api/agent/meta` 获取，§22）：
   - **数据工具（10 个，复用 §1–§17 路由与缓存）**：`screen_stocks`（条件选股，核心）、`search_stock`、`get_quote`、`get_indices`、`get_market_stats`、`get_ranking`、`get_hot_rank`、`get_limitup_pool`、`get_sectors`、`get_dragon_tiger`（`lib/agent.js#TOOL_ROUTES`）。
   - **历史工具（3 个，读本地归档做跨日查询）**：`history_overview`（各类归档覆盖天数与日期范围，供模型判断数据是否足够）、`history_screen`（最近 N 天跨日筛选：有涨停/热榜名次≤X/上过龙虎榜 组合条件）、`history_co_limitup`（与目标股票共同涨停关联度排行，缺失归档自动按日回补）（`lib/agent.js#HISTORY_TOOLS`）。
 
-**历史归档（v1.3.0，支撑历史工具）**：
+**历史归档（v1.3.0 写入，v1.6.0 增路由直读，支撑历史工具与历史日期查询）**：
 
-- 涨停池/热榜/龙虎榜/连板天梯四类数据按日归档至 `server/data/{limitup,hotrank,dragontiger,ladder}/{yyyyMMdd}.json`（gitignored，运行期生成）。
+- 涨停池/热榜/龙虎榜/连板天梯四类数据按日归档至 `server/data/{limitup,hotrank,dragontiger,ladder}/{yyyyMMdd}.json`（gitignored，运行期生成；**永久保存**，无清理策略）。
 - 写入双通道：① 对应路由（§10/§14/§15/§16）请求成功后写穿归档（节流窗口 `collection.rewriteIntervalMinutes`，默认 10min）；② 后台采集器按 `collection` 组排程（首跑延时默认 5s、周期默认 30min，龙虎榜仅上海时间 `collection.dragonTigerAfterHour` 默认 15 点后采集；总开关 `enabled` 与四类分项开关 `types` 均可在设置页关停，v1.4.0）。
-- 涨停池/龙虎榜可按 `date` 参数回补历史（`history_co_limitup` 自动回补，也可手动 `GET /api/limitup/pool?date=20261110` 触发写穿）；**热榜上游无日期参数，不可回补，归档自启用日起向前积累**——跨日热榜查询的覆盖范围以 `history_overview` 返回为准。
+- **读取（v1.6.0 归档直读，design.md D19）**：§10/§14/§15/§16 对早于今天的 `date` 优先读归档（命中 `meta.fromArchive=true`，零上游请求）；agent 数据工具经 invokeRoute 同样受益，历史工具（history_*）继续直接读归档。
+- 涨停池/龙虎榜可按 `date` 参数回补历史（`history_co_limitup` 自动回补，也可手动 `GET /api/limitup/pool?date=20261110` 触发写穿）；**热榜上游无日期参数，不可回补，归档自启用日起向前积累**——跨日热榜查询的覆盖范围以 `history_overview` 返回为准，`GET /api/hot-rank?date={历史日期}` 归档缺失时 404。
 - 归档文件损坏时按缺失处理（不影响服务），详见 design.md D15。
 
-**错误响应**：400（messages 校验失败）/ 413（请求体超限）/ 502（LLM 服务调用失败，message 含 HTTP 状态与响应摘录）/ 503（LLM 未配置，message 附配置指引）。
+**错误响应**（两阶段）：
+- **流开始前**（JSON 信封，HTTP 状态码即错误码）：400（sessionId 缺失 / message 为空或超长）/ 404（会话不存在或已删除）/ 413（请求体超限）/ 503（LLM 未配置，message 附配置指引）。
+- **流开始后**（HTTP 200 + `error` 事件）：`{status, message}`，如 502（LLM 服务调用失败，message 含 HTTP 状态与响应摘录）。此时 user 消息已落库，assistant 消息不落库。
 
 ## 19. 读取系统配置 `GET /api/config`（v1.4.0）
 
@@ -468,19 +506,19 @@ curl -X POST http://localhost:8787/api/agent/chat \
     },
     "agent": { "maxRounds": 6, "maxMessages": 30, "maxContent": 4000 },
     "cache": {
-      "snapshot": { "trading": 30, "closed": 600 },
-      "indices": { "trading": 30, "closed": 600 },
-      "kline": { "trading": 60, "closed": 1800 },
-      "sectors": { "trading": 60, "closed": 900 },
-      "bkstocks": { "trading": 60, "closed": 900 },
-      "limitup": { "trading": 120, "closed": 1800 },
-      "ladder": { "trading": 120, "closed": 1800 },
-      "related": { "trading": 300, "closed": 1800 },
-      "dragontiger": { "trading": 300, "closed": 1800 },
-      "hotrank": { "trading": 300, "closed": 600 }
+      "snapshot": { "trading": 30, "closed": 86400 },
+      "indices": { "trading": 30, "closed": 86400 },
+      "kline": { "trading": 60, "closed": 86400 },
+      "sectors": { "trading": 60, "closed": 86400 },
+      "bkstocks": { "trading": 60, "closed": 86400 },
+      "limitup": { "trading": 120, "closed": 86400 },
+      "ladder": { "trading": 120, "closed": 86400 },
+      "related": { "trading": 300, "closed": 86400 },
+      "dragontiger": { "trading": 300, "closed": 3600 },
+      "hotrank": { "trading": 300, "closed": 86400 }
     },
     "server": { "port": 8787, "tradingStart": "09:15", "tradingEnd": "15:05" },
-    "http": { "timeoutMs": 10000, "retries": 1, "retryBackoffMs": 300 }
+    "http": { "timeoutMs": 10000, "retries": 1, "retryBackoffMs": 300, "minIntervalMs": 100, "maxConcurrent": 4 }
   },
   "meta": {
     "source": "config", "fetchedAt": "2026-11-12T08:00:00.000Z", "fromCache": false,
@@ -489,7 +527,7 @@ curl -X POST http://localhost:8787/api/agent/chat \
 }
 ```
 
-字段说明：`cache.*` 单位为**秒**（trading 交易时段 / closed 收盘后，各缓存键语义见 design.md §5）；`llm.timeoutMs`/`http.timeoutMs`/`http.retryBackoffMs` 单位为毫秒；`meta.store.backend` ∈ `sqlite`（node:sqlite，Node ≥ 22.5）/ `json`（兜底 `server/data/config.json`，功能一致）。
+字段说明：`cache.*` 单位为**秒**（trading 交易时段 / closed 收盘后，各缓存键语义见 design.md §5；v1.6.0 起 closed 默认 24h、龙虎榜 1h，**实际过期封顶到下一交易日开盘**，见 D19）；`llm.timeoutMs`/`http.timeoutMs`/`http.retryBackoffMs`/`http.minIntervalMs` 单位为毫秒；`http.minIntervalMs`/`http.maxConcurrent` 为**按主机限流**参数（v1.6.1，同一上游主机相邻请求最小启动间隔 / 最大并发在途数，防上游隐性频率限制，见 design.md D20）；`meta.store.backend` ∈ `sqlite`（node:sqlite，Node ≥ 22.5）/ `json`（兜底 `server/data/config.json`，功能一致）。
 
 ```bash
 curl http://localhost:8787/api/config
@@ -516,12 +554,15 @@ curl http://localhost:8787/api/config
 | `agent.maxRounds` | 整数 1–20 |
 | `agent.maxMessages` | 整数 1–200 |
 | `agent.maxContent` | 整数 100–100000 |
-| `cache.{键}.trading` / `.closed` | 整数 5–7200（秒）；键限 §19 列出的 10 个 |
+| `cache.{键}.trading` | 整数 5–7200（秒）；键限 §19 列出的 10 个 |
+| `cache.{键}.closed` | 整数 5–86400（秒，v1.6.0 放宽；实际过期封顶下一交易日开盘） |
 | `server.port` | 整数 1–65535 |
 | `server.tradingStart` / `tradingEnd` | `HH:MM`（24 小时制）且 start 必须早于 end |
 | `http.timeoutMs` | 整数 1000–120000 |
 | `http.retries` | 整数 0–5 |
 | `http.retryBackoffMs` | 整数 0–10000 |
+| `http.minIntervalMs` | 整数 0–10000（v1.6.1，按主机限流：相邻请求最小启动间隔） |
+| `http.maxConcurrent` | 整数 1–32（v1.6.1，按主机限流：最大并发在途数） |
 | 未知配置组 / 组内未知字段 / 未知缓存键 / 未知采集类型 | 400（message 列出可选值） |
 
 **生效时机**：保存即热生效——采集开关/周期/延时变化自动重排定时器；TTL/HTTP/LLM/Agent 参数下次请求即用新值；**仅 `server.port` 需重启服务**（环境变量 `PORT` 始终优先于配置库）。
@@ -544,3 +585,117 @@ curl -X PUT http://localhost:8787/api/config \
 ```
 
 **错误响应**：400（字段校验失败 / 未知组或字段 / 请求体非合法 JSON，message 指明原因）/ 413（请求体超 64KB）/ 500（配置落库失败）。
+
+## 21. AI 助手会话管理 `/api/agent/sessions`（v1.5.0）
+
+会话与消息持久化在 `server/data/chat.db`（`node:sqlite`，不可用时兜底 `server/data/chat.json`，功能一致，见 design.md D17）。会话上限 **100** 个，超出在新建时自动修剪最旧（级联删除其消息与 trace）。全部接口无鉴权（同限制 6/16）。
+
+### 21.1 会话列表 `GET /api/agent/sessions`
+
+无参数。按最近更新（`updatedAt`）降序。
+
+```json
+{
+  "data": {
+    "list": [
+      { "id": "911cb0dc-…", "title": "今天大盘怎么样？", "createdAt": "2026-11-12T08:00:00.000Z",
+        "updatedAt": "2026-11-12T08:03:21.000Z", "messageCount": 4 }
+    ]
+  }
+}
+```
+
+### 21.2 新建会话 `POST /api/agent/sessions`
+
+请求体可选（`{}` 或 `{"title":"自定义标题"}`，title ≤60 字符；缺省为「新会话」，首条消息发送后自动以消息前 30 字命名）。响应 `data` 为会话对象：
+
+```json
+{ "data": { "id": "uuid", "title": "新会话", "createdAt": "…", "updatedAt": "…" } }
+```
+
+### 21.3 会话详情 `GET /api/agent/sessions/{id}`
+
+返回会话对象 + 全量消息（时间升序）。消息元素：`role ∈ user/assistant`；assistant 消息附 `reasoning`（思考过程，可 null）、`toolTrace`（结构同 §18 done 事件）、`stocks`（可点击股票）、`traceId`（§23 入参，可 null）。404：会话不存在。
+
+```json
+{
+  "data": {
+    "id": "uuid", "title": "今天大盘怎么样？", "createdAt": "…", "updatedAt": "…",
+    "messages": [
+      { "role": "user", "content": "今天大盘怎么样？", "reasoning": null, "toolTrace": null,
+        "stocks": null, "traceId": null, "createdAt": "…" },
+      { "role": "assistant", "content": "三大指数今日…", "reasoning": "用户想知道大盘…",
+        "toolTrace": [ { "tool": "get_indices", "label": "大盘指数", "round": 1, "args": {},
+                         "status": "ok", "summary": "上证指数 3680.64 +0.46%…", "durationMs": 400 } ],
+        "stocks": [], "traceId": "6df08d49-…", "createdAt": "…" }
+    ]
+  }
+}
+```
+
+### 21.4 重命名会话 `PUT /api/agent/sessions/{id}`
+
+请求体 `{"title":"新标题"}` 必填非空（≤60 字符，违反 → 400）。响应 `data` 为更新后的会话对象。404：会话不存在。
+
+### 21.5 删除会话 `DELETE /api/agent/sessions/{id}`
+
+级联删除该会话全部消息与 trace。响应 `{ "data": { "deleted": "uuid" } }`。404：会话不存在。
+
+```bash
+curl http://localhost:8787/api/agent/sessions
+curl -X POST http://localhost:8787/api/agent/sessions -H 'Content-Type: application/json' -d '{}'
+curl http://localhost:8787/api/agent/sessions/{id}
+curl -X PUT http://localhost:8787/api/agent/sessions/{id} -H 'Content-Type: application/json' -d '{"title":"复盘记录"}'
+curl -X DELETE http://localhost:8787/api/agent/sessions/{id}
+```
+
+## 22. Agent 元信息 `GET /api/agent/meta`（v1.5.0）
+
+可观测性接口：返回**系统提示词全文**与 **13 个工具完整定义**（前端「📋 系统提示词与工具」弹窗数据源），用于检查模型被注入了什么指令、能选哪些工具、参数 Schema 是否正确。
+
+```json
+{
+  "data": {
+    "systemPrompt": "你是 A 股行情数据服务的 AI 选股助手…（全文）",
+    "maxRounds": 6,
+    "tools": [
+      { "name": "screen_stocks", "label": "条件选股", "kind": "data",
+        "description": "按指标区间筛选股票…",
+        "parameters": { "type": "object", "properties": { "pctMin": { "type": "number" }, "…": {} } } }
+    ]
+  }
+}
+```
+
+`kind ∈ data`（10 个数据工具，经 invokeRoute 复用 §1–§17 路由）/ `history`（3 个历史归档工具）。`maxRounds` 为当前生效的 `agent.maxRounds` 配置值。
+
+## 23. 调用链路 trace `GET /api/agent/traces/{id}`（v1.5.0）
+
+调用链路看板数据源：单次对话的**每轮 LLM 输入输出与工具调用明细**，用于评估模型输入输出质量、工具选择正确性、工具参数正确性。traceId 来自 §18 `done` 事件或 assistant 消息的 `traceId` 字段。
+
+```json
+{
+  "data": {
+    "sessionId": "uuid", "model": "model-name", "llmRounds": 2, "truncated": false,
+    "durationMs": 8300,
+    "usage": { "promptTokens": 1200, "completionTokens": 88, "totalTokens": 1288 },
+    "rounds": [
+      { "round": 1, "inputMessages": 2, "durationMs": 4100,
+        "reasoning": "用户想知道大盘情况，我应该调用指数工具。",
+        "content": "",
+        "finishReason": "tool_calls",
+        "usage": { "promptTokens": 600, "completionTokens": 40, "totalTokens": 640 },
+        "toolCalls": [
+          { "tool": "get_indices", "label": "大盘指数", "args": {}, "status": "ok",
+            "summary": "上证指数 3680.64 +0.46%…", "durationMs": 400,
+            "resultPreview": "{\"data\":[…（工具完整返回的 JSON 字符串，截断至 ≤1500 字符）" } ] },
+      { "round": 2, "inputMessages": 4, "durationMs": 4200,
+        "reasoning": "工具已返回，组织回答。", "content": "三大指数今日表现如下…",
+        "finishReason": "stop",
+        "usage": { "…": "…" }, "toolCalls": [] }
+    ]
+  }
+}
+```
+
+字段说明：`inputMessages` 为该轮发给 LLM 的消息条数（系统提示词 + 历史 + 工具结果回填，轮次间递增可验证上下文组装）；`finishReason`（v1.6.2）为上游 `choices[0].finish_reason`（`stop` 正常 / `tool_calls` 转工具调用 / `length` token 预算打满被截断——推理模型思考过程占满 `maxTokens` 时 content 为空即此因 / `content_filter` 上游审查拦截；上游未返回时为 `null`）；`usage` 可能为 `null`（上游未返回）；`resultPreview` 为压缩后工具结果的 JSON 字符串截断（≤1500 字符）。客户端中止的对话**不产生 trace**。404：trace 不存在（或所属会话已删除）。

@@ -4,6 +4,198 @@
 
 ---
 
+## v1.6.2（2026-11-13）
+
+**空回答原因区分：finish_reason 捕获 + 可操作错误提示**：对话连续出现「（模型未返回内容，请重试或换个问法）」。排查（chat.db `agent_traces` 留痕）定位为推理模型的思考过程（reasoning_content）耗尽 maxTokens=2048 预算——5 次失败末轮 completionTokens 全部正好 2048、content 为空、reasoning 长达 3700–4400 字符；上游本已返回 `finish_reason=length` 明示截断，但旧代码丢弃该字段，用户侧与日志只能给笼统提示。本版：① `lib/llm.js` 流式/非流式均捕获 `choices[0].finish_reason` 并透传；② `lib/agent.js` 空回答按 finish_reason 给出**差异化提示**（length→引导调大 maxTokens、content_filter→审查拦截、其余→限流/异常并指路服务端日志）；③ trace 每轮记录 `finishReason`，TracePanel 轮次头部显示告警标签；④ 进程日志补 finish_reason 与当前 maxTokens。另将线上 `config.db` 的 `llm.maxTokens` 2048→8192（本次故障的直接修复）。
+
+### 新增/变更
+
+**后端**
+- `lib/llm.js`：`chatCompletionsStream` 聚合最后一个 chunk 的 `finish_reason`（须在 delta 判断前捕获——携带 finish_reason 的 chunk 其 delta 可能为空对象）；`chatCompletions`（非流式）同步捕获；空响应 warn 日志附 `finish_reason`；返回消息对象新增 `finishReason` 字段（null=上游未给）
+- `lib/agent.js`：新增 `emptyReplyMessage()`——空回答提示按 finish_reason 区分：`length` →「思考+输出用尽 maxTokens 上限，请在设置→AI 模型调大（推理模型建议 ≥8192）」；`content_filter` →「被上游内容审查拦截」；其余 →「可能上游限流或服务异常，持续失败查看服务端 [llm]/[agent] 告警」。空回答 warn 日志补 `finish_reason` 与生效 `maxTokens`；`trace.rounds` 每轮新增 `finishReason`
+- `api.js`：`/api/health` → version 1.6.2
+
+**前端**
+- `TracePanel.vue`：轮次头部新增 finish_reason 告警标签（`stop`/`tool_calls` 正常不显示；`length` →「⚠️ 截断：maxTokens 打满」；`content_filter` →「⚠️ 内容审查拦截」；其余原样展示）
+
+**文档**
+- api.md §23：trace `rounds` 示例与字段说明补 `finishReason`（含各取值语义）
+
+**配置（数据，非代码）**
+- `server/data/config.db`：`llm.maxTokens` 2048 → 8192。推理模型的思考过程与正式回答**共用** max_tokens 预算，2048 对复杂问题必然被思考耗尽导致「返回空」
+
+### 兼容性说明
+
+- `finishReason` 为返回值/trace 的**新增**字段：旧 trace 数据无此字段，TracePanel 空值不渲染标签，正常展示；上游未返回 finish_reason 时为 null，行为退化为原通用提示
+- 空回答提示文案变化仅影响用户可见文本，SSE 协议与 done 事件结构不变
+
+### 验证记录（2026-11-13，本机 Node v24.14.0；/tmp/ws-fr-test 隔离副本 + mock SSE 上游端到端，未触碰真实 server/data/ 配置）
+
+| 项目 | 结果 |
+|------|------|
+| mock SSE 端到端（length / content_filter / 正常 stop / 空 stop 四场景） | 9 pass 0 fail：流式层捕获 finish_reason、content 空时 reasoning 保留、agent 差异化提示（含 maxTokens 引导/审查提示/通用提示含日志指引）、trace 轮次留痕 finishReason、正常回答不受影响 |
+| 真实失败 trace 复盘（chat.db `agent_traces` 5 条） | 末轮 completionTokens 均 =2048（打满 maxTokens）、content 长度 0、reasoning 3711–4457 字符——与 length 截断判定一致 |
+| `node --check`（llm.js / agent.js / api.js）+ 前端 `vite build` | 通过 |
+
+---
+
+## v1.6.1（2026-11-13）
+
+**上游按主机限流 + 全链路失败日志**（D20）：对话中出现「返回空导致失败」，疑似行情上游对频繁访问有隐性频率限制（触发后返回空数据/拒连），且多处失败被静默容忍、无日志可查。本版：① `lib/http.js` 内置**按主机限流**（同主机相邻请求最小启动间隔 + 并发在途上限），参数入 `config.http` 可在设置页调整热生效；② 补齐失败日志——上游请求逐次尝试留痕、快照分页失败逐页告警、**空快照改为抛错**（转新浪兜底而非向下输出空列表）、LLM 坏 chunk 统计与空响应告警、agent 工具失败/空回答/轮数中断落进程日志、热榜/龙虎榜单平台降级与历史回补失败留痕。
+
+### 新增/变更
+
+**后端**
+- `lib/http.js`：
+  - 新增每主机限流器（FIFO 队列）：`maxConcurrent`（同主机并发在途上限，默认 4）+ `minIntervalMs`（同主机相邻请求启动最小间隔，默认 100ms）；所有上游请求（含重试）经 `fetchText` 单点过闸，对 sources 层透明；配置使用时读取，改值即生效
+  - 每次失败尝试打 `console.warn`：URL、尝试轮次、失败原因（网络错误/超时/HTTP 状态 + 响应体摘录 200 字符——限流/风控页常在响应体说明原因）；网络错误**下钻 cause 链**取真实错误码（undici 的 message 恒为「fetch failed」，不钻无法区分 `UND_ERR_SOCKET` 上游断连与 `ECONNREFUSED` 本机不通）；JSON 解析失败同样留摘录
+- `lib/config.js`：`http` 组新增 `minIntervalMs`（默认 100，校验 0–10000）与 `maxConcurrent`（默认 4，校验 1–32）；深合并语义下已有部署自动补默认值
+- `sources/eastmoney.js`：`fetchFullSnapshot` 分页失败由静默容忍改为**逐页 warn + 汇总不完整告警**（成功只数/预期 total/失败页号）；**空快照抛错**（「疑似上游限流」），走 api.js 新浪兜底链，不再把空列表写入缓存供下游「返回空」
+- `lib/llm.js`：流式响应统计坏 chunk（JSON 解析失败）数量并保留首例摘录；`content/reasoning/tool_calls/usage` 全空时打 warn（含 model/url）——对话「返回空」的底层排查锚点
+- `lib/agent.js`：工具执行异常/工具级 error/LLM 空回答（无 content 且无 tool_calls）/达到最大轮数中断，均落 `console.warn`（含轮次、model、耗时、usage、args 摘录）；`history_co_limitup` 归档回补逐日失败留痕（原仅计数）
+- `api.js`：`/api/dragon-tiger` 与 `/api/hot-rank` 单平台失败降级时打 warn（原仅写入 meta.platforms）；`/api/limitup/related` 历史回看单日失败留痕；`/api/health` → version 1.6.1
+
+**前端**
+- `SettingsView.vue`：「上游 HTTP」面板新增 最小请求间隔（0–10000ms）与 单主机最大并发（1–32）两个输入，附调优提示（疑似限流调大间隔/调小并发；快照刷新变慢与 TTL 的权衡）
+
+**文档**
+- design.md：ADR **D20**（按主机限流 + 失败日志：决策/理由/取舍/被否方案）、F11 行、§5 限速策略补限流条目
+- api.md：§19 `http` 组示例与字段说明补两字段、§20 校验表补两行
+- README：系统设置功能行与可配项表补「调用频率限制」
+
+### 兼容性说明
+
+- 已有部署的 `http` 组经深合并自动补 `minIntervalMs:100`/`maxConcurrent:4` 默认值（D16 部分合并语义），无需手工迁移；如上游确认无限流可把间隔调回 0
+- 限流按「主机」归组：东财三 fallback 主机（20/43/52.push2）各自计数，与主机 fallback 语义正交；不同上游互不挤占
+- 默认参数下全市场快照（≈60 页）由瞬时 6 并发突发变为 ≤4 并发、≥100ms 间隔的平滑拉取（约 6–8s），仍在交易时段 30s TTL 预算内；sources 层代码零改动
+
+### 验证记录（2026-11-13，本机 Node v24.14.0；限流单测 + /tmp/ws-rate-test 隔离副本端到端 + 真实上游实况，未触碰真实 server/data/）
+
+| 项目 | 结果 |
+|------|------|
+| 限流生效（本地 mock 服务） | ✅ 8 个并发 `fetchText` 实测 706ms（默认间隔 100ms，理论下界 700ms），全部成功返回 |
+| 失败日志 | ✅ 404 请求逐次尝试打 warn：URL + 「第 N/M 次尝试」+ HTTP 状态 + 响应体摘录；最终抛 UpstreamError（cause 保留状态与摘录） |
+| 配置默认值 | ✅ `init()` 后 http 组含 `minIntervalMs:100, maxConcurrent:4` |
+| 配置校验 | ✅ 合法值（250/2）更新成功；`-1`/`10001`/`0`/`33`/`1.5` 全部 400 拦截（中文报错含字段路径与范围）；部分补丁深合并正确（改 timeoutMs 不动限流字段） |
+| 隔离副本端到端 | ✅ :9921 独立数据目录启动正常，health 返回 version 1.6.1；`GET/PUT /api/config` 限流字段往返一致 |
+| 真实上游失败日志实况 | ✅ 测试期间本机恰逢东财限流：clist 三主机（20/43/52）6 次尝试逐条 warn（`fetch failed \| UND_ERR_SOCKET`，cause 链下钻生效），空快照抛错转新浪兜底返回 5578 只——用户报告的「返回空」场景全链路可追溯 |
+| 失败原因二分诊断 | ✅ 5 种请求形态（编码/未编码 × pz100/pz2 × 全字段/2字段 × 多段/单段 fs）**不经限流器**裸 fetch 全部同样失败（`UND_ERR_SOCKET`，83–408ms），而同一小请求数分钟前曾成功（HTTP 200）——确认为**时变的上游 IP 级频率限制**，与 URL 构造/请求大小/限流器无关，佐证「调用频率限制导致失败」的判断 |
+| 前端构建 | ✅ `vite build` 成功（js 1204.84kB / gzip 401.50kB） |
+| 语法检查 | ✅ `node --check` 服务端 6 个改动文件全部通过 |
+
+测试数据清理：测试服务（:9921）已停止，`/tmp/ws-rate-test`、`/tmp/ws-diag`、`/tmp/test-ratelimit.mjs`、`/tmp/ws-server.log` 已删除；无残留进程。
+
+## v1.6.0（2026-11-12）
+
+**归档直读 + 收盘长缓存**（F13，D19）：涨停池/连板天梯/龙虎榜/人气热榜四类收盘后即为静态终态的数据，历史日期请求**优先读本地归档**（命中零上游请求，`meta.fromArchive`）；热榜新增 `date` 参数（上游无历史接口，归档缺失如实 404）；收盘 TTL 默认调至 24h（龙虎榜 1h、空列表 30min 封顶），**实际过期封顶到下一交易日开盘**（长缓存的正确性前提——否则周一盘前会命中上周五旧快照）。
+
+### 新增
+
+**后端**
+- `lib/market.js`：`ttlBySession` 替换为 `secondsUntilNextTradingStart(from?)`——距下一交易日开盘秒数（开盘时刻取 `config.server.tradingStart`，仅识别工作日；上海固定 UTC+8，`Date.UTC(y, m-1, d+advance, startH-8, startM)` 精确计算，`Date.UTC` 自动归一化跨月/跨年）
+- `lib/cache.js`：`cached()` 的 `ttlMs` 支持**函数形式** `(value) => ms`——按 producer 结果定 TTL（龙虎榜发布前的空列表封顶 30min）
+- `lib/history.js`：新增 `loadRecordWithMeta(type, date8)`（返回 `{data, savedAt}`，供归档直读路由标注落盘时间）；`loadRecord` 保持不变（agent 历史工具兼容）
+- `api.js`：
+  - `cacheTtl()` 收盘分支改为 `min(closed, secondsUntilNextTradingStart())`——收盘缓存最晚在下一交易日开盘时失效
+  - 新增 `tryArchive(type, date8)` 归档直读：早于今天且归档存在 → 返回 `cached()` 兼容形状（`fromArchive:true` + `archiveSavedAt`）；**工作日空归档视为未命中**（盘前/龙虎榜发布前的中途快照，回退上游后写穿覆盖为终态 = 自愈）；周末空归档照常返回（非交易日占位）
+  - `getLimitUpPool` 内置归档直读（pool 路由 / ladder 派生 / related 历史回看 / agent 工具四条路径同时受益）；`/api/ladder`、`/api/dragon-tiger` 路由级归档直读（天梯归档缺失时由池归档派生，仍零上游）；归档命中不再重复写穿
+  - `/api/hot-rank` 新增可选 `date` 参数：历史日期仅由归档提供（缺失 404 + 覆盖范围说明），今天/缺省走原实时路径；`meta` 增加 `date` 字段；实时 `metaOf` 透传 `fromArchive`/`archiveSavedAt`
+  - `/api/health` → version 1.6.0
+- `lib/config.js`：`cache.*.closed` 默认 600–1800s → **86400s**（龙虎榜 3600s：17:00 发布语义）；校验范围分档 trading 5–7200 / closed 5–**86400**
+- `lib/agent.js`：`get_hot_rank` 工具增加 `date` 参数（历史热榜由归档直读，缺失时向用户如实说明覆盖范围）
+
+**前端**
+- `HotRankView.vue`：新增日期选择（同龙虎榜页交互，`type=date`、max 今天）；历史日期命中归档时 meta 行显示「📦 历史归档 · 保存于 …」徽章；归档缺失的 404 文案直接在错误态展示
+- `SettingsView.vue`：缓存 TTL 说明更新（交易 5–7200 / 收盘 5–86400，收盘缓存最晚下一交易日开盘失效）；closed 输入框 `max=86400`
+
+**文档**
+- design.md：ADR **D19**（归档直读 + 开盘封顶长缓存：决策/理由/取舍/被否方案）、F13 范围行、D6/D15 补 v1.6.0 更新、架构图、映射表 +1 行、§5 TTL 表更新（24h*/1h* + 归档直读注记）、限制 2/14 补充
+- api.md：通用约定补 `meta.fromArchive`/`archiveSavedAt` 与开盘封顶说明；§10/§14/§16 归档直读注记；§15 增 `date` 参数 + 404 语义 + curl 示例；§18 归档块补读取路径；§19 默认值更新；§20 校验范围分档
+- README：功能清单 v1.6.0、热榜/涨停中心/龙虎榜行补历史查询说明、缓存策略句更新
+
+### 兼容性说明
+
+- **已有部署的 `cache.*.closed` 保持旧值**：配置默认值只填充库中缺失的字段（D16 部分合并语义），升级后如需 24h 长缓存，在设置页把 closed 改为 86400 即可（trading 不受影响）
+- `loadRecord`/agent 历史工具/归档文件格式均无变化，旧归档直接可用
+- 收盘 TTL 即使配置为 86400，实际过期也不会晚于下一交易日开盘（正确性由服务端保证，与配置无关）
+
+### 验证记录（2026-11-12，本机 Node v24.14.0；/tmp/wsv16 隔离副本 + 伪造历史归档，测试端口 :9920，行情上游真实可达；未触碰真实 server/data/）
+
+| 项目 | 结果 |
+|------|------|
+| `secondsUntilNextTradingStart` 边界 | ✅ 9 用例全过：工作日盘前（当日开盘 75min）/收盘后（次日 17.25h）/周五晚（周一 65.25h）/周六/周日/刚过开盘（次日）/尾盘 14:59:59/跨月末/跨年 |
+| 四类归档直读 | ✅ pool/ladder/dragontiger/hot-rank `?date=20261111` 均返回伪造归档数据，`meta.fromArchive=true` + `archiveSavedAt`，零上游请求 |
+| 热榜历史 limit 切片 | ✅ `?date=20261111&limit=1` 返回 1 条、`total:2` 保留全量计数，`meta.date=20261111` |
+| 热榜归档缺失 | ✅ `?date=20261101` → 404「上游不提供历史热榜接口，归档自功能启用之日起逐日积累」；未来日期 → 400 |
+| 周末空归档 | ✅ `pool?date=20261108`（周日，空 list 归档）照常返回 `fromArchive=true`（非交易日占位） |
+| 工作日空归档自愈 | ✅ `pool?date=20261110`（空 list 归档）回退上游 → 返回真实数据 93 只（无 fromArchive），归档文件被写穿覆盖为终态 |
+| 配置校验分档 | ✅ `closed=86400` → 200；`closed=86401` → 400「取值范围 5–86400」；`trading=7201` → 400「取值范围 5–7200」；GET 确认 dragontiger 默认 3600 |
+| 实时路径回归 | ✅ 今日 hotrank 实时/缓存命中正常，`meta.date=20261112`；今日 pool 写穿归档 `20261112.json` 生成 |
+| health | ✅ version 1.6.0 |
+| 前端构建 | ✅ `vite build` 成功（js 1203.74kB / gzip 401.11kB） |
+| 语法检查 | ✅ `node --check` 服务端 6 个改动文件全部通过 |
+
+测试数据清理：测试服务（:9920）已停止，`/tmp/wsv16`、`/tmp/test-nextopen.mjs` 已删除；无残留进程。
+
+**待补验证**：浏览器走查热榜日期选择与归档徽章（构建通过、交互复用龙虎榜页同款模式）；下一交易日开盘时刻的 TTL 封顶实况（逻辑经 9 用例单测覆盖，建议次日观察盘前首刷 `fromCache:false`）。
+
+---
+
+## v1.5.0（2026-11-12）
+
+AI 助手**会话持久化 + SSE 流式输出 + 全链路可观测**（F12）：对话/消息/调用链路服务端落库（多会话管理，切页/刷新不丢）；`/api/agent/chat` 改为 SSE 流式（思考过程与回答逐字推送、工具进度实时可见、客户端断开即中止）；新增调用链路看板（每轮 LLM 输入输出/tokens/工具参数与结果预览）与系统提示词/工具清单查看页。
+
+### 新增
+
+**后端**
+- `lib/chat-store.js`（新）：会话存储层——`node:sqlite`（主，`server/data/chat.db`，`chat_sessions`/`chat_messages`/`agent_traces` 三表 + 索引，ExperimentalWarning 抑制），不可用（Node < 22.5）自动回退 `server/data/chat.json`（tmp+rename 原子写），启动日志打印实际后端（与 config-store 同模式，D16）；会话上限 100、新建时修剪最旧（级联删消息/trace）；`appendMessage`（reasoning/toolTrace/stocks/traceId 随消息落库）、`listMessages(limit)`（取最近 N 条升序返回）、`saveTrace`/`getTrace`
+- `lib/llm.js`：新增 `chatCompletionsStream`（`stream:true` SSE 帧解析：`content`/`reasoning_content` 增量逐段回调、`tool_calls` 按 `delta.index` 聚合 id/name/arguments 分片、usage 收集、超时 + 外部 signal 合并的 AbortController）；非流式 `chatCompletions` 补充返回 `reasoning`/`usage`
+- `lib/agent.js`：`runAgent(history, invoke, emit, options)` **事件化**——经 emit 逐段推送 `round_start`/`reasoning`/`content`/`tool_call`/`tool_result`；每轮记录 `rounds[]` 调用链路（inputMessages/reasoning/content/usage/durationMs/toolCalls[args/status/summary/durationMs/resultPreview ≤1500 字]）并累计 usage；支持 `options.signal` 中止（aborted 结果不落库）；新增 `getAgentMeta()`（系统提示词全文 + 13 工具定义含参数 JSON Schema）
+- `api.js`：`POST /api/agent/chat` 重写为 **SSE 流式**（两阶段错误：流开始前 400/404/503 走 JSON 信封，流开始后走 `error` 事件；请求体由 `messages` 数组改为 `{sessionId, message}`，历史由服务端从会话库加载最近 `agent.maxMessages-1` 条，前端不再携带；用户消息即时落库、首条消息自动作会话标题截 30 字；客户端断开 → AbortController 链中止 LLM 与工具循环，半截回答与 trace 不落库；完成后 trace + assistant 消息落库，`done` 事件带 traceId 不带 rounds——体积大，看板按 traceId 拉取）；新增 7 条路由：`GET/POST /api/agent/sessions`、`GET/PUT/DELETE /api/agent/sessions/{id}`、`GET /api/agent/meta`、`GET /api/agent/traces/{id}`；`/api/health` → version 1.5.0
+- `index.js`：启动时 `initChatStore()`，打印会话存储后端与路径
+
+**前端**
+- `chatStore.js`（新）：**模块级单例**会话状态（tab 切换组件卸载不丢，根治 v1.3.0「切页回来对话消失」）——sessions/activeSessionId/messages/isStreaming；localStorage 记忆活动会话 id、刷新后恢复；`sendMessage`（乐观推送 + SSE 事件 reducer：reasoning/content 逐字追加、tool_call→tool_result 状态流转、done 收尾汇总）；`stopStreaming`（abort fetch）；建/删/改会话
+- `api.js`：新增 `apiPostSse`（fetch + ReadableStream 手工解析 SSE 帧——`EventSource` 不支持 POST；按 `\r?\n\r?\n` 分帧、解析 `event:`/`data:` 行、容忍坏帧）、`apiDelete`
+- `ChatView.vue` 重写：左侧会话列表（活动高亮/悬停重命名/删除/＋新会话）+ 右侧聊天区；助手气泡：💭 思考过程（流式逐字显示、可折叠）、工具轨迹标签（running 转圈/ok/error，悬浮显示参数，附摘要与耗时）、流式光标、「停止生成」按钮；消息尾 meta（模型/轮数/耗时/tokens/truncated）+「🔗 调用链路」入口；左栏底部「📋 系统提示词与工具」入口
+- `TracePanel.vue`（新）：调用链路看板（右侧抽屉）——汇总条（模型/轮数/总耗时/tokens 入出）+ 每轮卡片：输入消息数/💭 思考/📤 输出/tokens/耗时，每个工具调用的 参数（pretty JSON）/状态/摘要/耗时/可展开返回结果预览——用于评估模型输入输出质量、工具选择与参数正确性
+- `AgentMetaDialog.vue`（新）：系统提示词全文 + 13 工具清单（code 名/中文名/数据·历史类型/描述/参数 Schema 折叠展示）
+
+**文档**
+- api.md：§18 重写为 SSE 流式（8 类事件表/两阶段错误/断开中止语义/`curl -N` 示例）；新增 §21 会话管理 / §22 Agent 元信息 / §23 调用链路 trace；通用约定补方法例外与 SSE 响应说明
+- design.md：ADR **D17**（会话持久化：服务端唯一真相源/sqlite+JSON 兜底/上限修剪/断开落库语义）/ **D18**（SSE 流式 + 可观测：事件协议/流式聚合/res close 断开检测/trace 体积控制）、F12 范围行、架构图与两条数据流更新、映射表 +3 行、限制 12/15 重写、v2 候选更新
+- README：功能清单 v1.5.0、AI 助手章节补会话持久化/流式/可观测说明、目录结构（chat-store.js/chatStore.js/TracePanel/AgentMetaDialog/chat.db）、文档索引接口计数
+
+### 实现过程中的实测修正
+
+| # | 发现 | 处理 |
+|---|------|------|
+| 1 | POST + SSE 下 `req` 的 `'close'` 在请求体读完后即触发（Node ≥18 语义），**不能**用于客户端断开检测——首版实现断开后 Agent 照常跑完并落库；用最小 http 探针（:9912/:9913）实测确认 `res` 的 `'close'` 才对应底层连接终止（正常 `res.end()` 后也触发，需 `writableEnded` 区分） | 断开检测改 `res.on('close')` + `!res.writableEnded` 才 abort；修复后实测断开仅落 user 消息（+1 条） |
+| 2 | `EventSource` 不支持 POST（SSE 需携带 JSON body） | 前端 `apiPostSse`：fetch + ReadableStream 手工分帧解析，服务端加 `X-Accel-Buffering: no`（反代关闭缓冲保证逐字推送） |
+| 3 | 流式 `tool_calls` 的 id/name/arguments 均可能分片或缺失（mock 故意将 name 拆为 `get_in`+`dices` 两帧验证） | 按 `delta.index` 聚合，id 缺失时兜底生成 `call_stream_N` |
+
+### 验证记录（2026-11-12，本机 Node v24.14.0；mock 流式 LLM :9911 + 测试服务 :9910，行情上游真实可达；全部在 /tmp 副本运行，未触碰真实 server/data/）
+
+| 项目 | 结果 |
+|------|------|
+| SSE 事件序列 | ✅ session→round_start→reasoning×2→tool_call→tool_result→round_start→reasoning→content×2→done，逐段推送、帧格式正确 |
+| 流式 tool_calls 聚合 | ✅ name 分片（`get_in`+`dices`）+ arguments 分片正确聚合为 `get_indices {}` 并成功执行 |
+| 真实工具链路 | ✅ get_indices 经 invokeRoute 返回**真实**三大指数数据（仅 LLM 为 mock），流式链路下数据工具复用正常 |
+| 会话持久化 | ✅ 首条消息自动标题「今天大盘怎么样？」；messageCount、reasoning、toolTrace、traceId、createdAt 齐全；列表按 updatedAt 降序 |
+| 多轮对话 | ✅ 第二轮服务端加载历史（trace inputMessages 2→4），前端不携带历史 |
+| 调用链路 trace | ✅ rounds=2：每轮 reasoning/content/usage（1200/88/1288）/durationMs，toolCalls args/status/summary/durationMs/resultPreview 完整；未知 traceId → 404 |
+| 客户端断开中止 | ✅ curl 1s 断开 → Agent 中止，库中仅 +1 条（user 消息），assistant 半截回答与 trace 未落库 |
+| 会话 CRUD | ✅ 创建（可选 title）/重命名（title 必填 400 校验）/删除（级联：会话详情与 trace 均 404）/未知会话 404/空 message 400 |
+| JSON 兜底后端 | ✅ 将 sqlite 路径指向非法目录 → 启动日志「会话存储: json」，SSE 全链路正常，chat.json 落库会话+消息+trace，API 读回一致 |
+| 前端构建 | ✅ `vite build` 598 modules 成功（js 1202.83kB / gzip 400.79kB） |
+| 语法检查 | ✅ `node --check` 服务端 5 个改动文件全部通过 |
+
+测试数据清理：mock LLM（:9911）、测试服务（:9910）与探针进程已停止，`/tmp/wstest*` 已删除；无残留 node 进程。
+
+**待补验证**：浏览器交互走查（流式逐字渲染观感、TracePanel/AgentMetaDialog 展示、切页/刷新后会话恢复——构建通过、组件逻辑经代码复核）；接入真实 LLM 后的流式对话质量与 token 消耗。
+
+---
+
 ## v1.4.0（2026-11-12）
 
 服务端配置持久化到数据库 + 前端设置页（F11）：数据采集开关/周期、LLM 配置、Agent 对话上限、缓存 TTL、服务端口+交易时段、上游 HTTP 超时/重试共 **6 组配置**在线读写，除端口外保存即热生效。

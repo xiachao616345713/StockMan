@@ -59,14 +59,36 @@ export function isTradingTime() {
 }
 
 /**
- * 按交易时段选择缓存 TTL
+ * 距下一个交易日开盘的秒数（config.server.tradingStart，周一至周五，不识别节假日）。
+ * 收盘后缓存 TTL 的上界（v1.6.0，见 docs/design.md D19）：收盘后数据静态可长缓存，
+ * 但必须在下一个交易日开盘前过期——否则周一盘前会命中上周五的旧快照（行情尚未刷新）。
  *
- * @param {number} tradingTtlMs 交易时段 TTL
- * @param {number} closedTtlMs 非交易时段 TTL
- * @returns {number}
+ * 上海时区固定 UTC+8（无夏令时）：目标日开盘时刻 = Date.UTC(y, m-1, d, startH - 8, startM)。
+ *
+ * @param {Date} [from] 参考时间（可注入用于测试）
+ * @returns {number} 剩余秒数（至少 60，避免产生零 TTL）
  */
-export function ttlBySession(tradingTtlMs, closedTtlMs) {
-    return isTradingTime() ? tradingTtlMs : closedTtlMs;
+export function secondsUntilNextTradingStart(from = new Date()) {
+    const now = shanghaiParts(from);
+    const { tradingStart } = getGroup('server');
+    const [startHour, startMinute] = String(tradingStart).split(':').map(Number);
+    const nowMinutes = now.hour * 60 + now.minute + now.second / 60;
+    const startMinutes = startHour * 60 + startMinute;
+    const isWeekend = (date) => {
+        const weekday = shanghaiParts(date).weekday;
+        return weekday === 'Sat' || weekday === 'Sun';
+    };
+    // 工作日且尚未到今日开盘 → 目标为今天；否则（已过开盘/周末）→ 向后找最近的工作日
+    let advanceDays = 0;
+    if (isWeekend(from) || nowMinutes >= startMinutes) {
+        advanceDays = 1;
+        while (isWeekend(new Date(from.getTime() + advanceDays * 86_400_000))) {
+            advanceDays += 1;
+        }
+    }
+    // Date.UTC 自动归一化 day+advanceDays 的跨月/跨年
+    const openEpochMs = Date.UTC(now.year, now.month - 1, now.day + advanceDays, startHour - 8, startMinute);
+    return Math.max(60, Math.round((openEpochMs - from.getTime()) / 1000));
 }
 
 /** 上海时区今天的 yyyyMMdd（涨停池/复盘接口的 date 参数默认值） */

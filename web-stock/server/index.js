@@ -16,6 +16,7 @@ import { handleApiRequest } from './api.js';
 import { clearCache, cacheSize } from './lib/cache.js';
 import { dataDir, isDataDirPresent } from './lib/history.js';
 import { init as initConfig, getGroup, storeInfo } from './lib/config.js';
+import { initChatStore, chatStoreInfo } from './lib/chat-store.js';
 import { start as startCollector } from './lib/collector.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,9 @@ const WEB_DIST = path.resolve(__dirname, '../web/dist');
 // 配置初始化：探测存储后端（sqlite/JSON）、载入库中值并深合并默认、首跑播种 env。
 // 必须在读取 PORT、启动采集器之前 await（顶层 await 会暂停后续语句直至完成）。
 await initConfig();
+
+// AI 助手会话存储初始化（v1.5.0）：node:sqlite（chat.db）/ JSON 兜底，与配置存储同款探测
+await initChatStore();
 
 // 端口：env.PORT 为部署期覆盖（优先级最高），否则取配置库 server.port（设置页可改，需重启生效）
 const PORT = Number(process.env.PORT) || getGroup('server').port;
@@ -121,9 +125,11 @@ function respondText(res, status, text) {
 
 server.listen(PORT, () => {
     const store = storeInfo();
+    const chatStore = chatStoreInfo();
     console.log(`web-stock server 已启动: http://localhost:${PORT}`);
     console.log(`API 示例: http://localhost:${PORT}/api/health`);
     console.log(`配置存储: ${store.backend}${store.backend === 'json' ? '（node:sqlite 不可用，已回退 JSON）' : ''} → ${store.path}`);
+    console.log(`会话存储: ${chatStore.backend} → ${chatStore.path}`);
     console.log(`前端目录: ${WEB_DIST}${fs.existsSync(WEB_DIST) ? '' : '（尚未构建）'}`);
     console.log(`缓存条目: ${cacheSize()}`);
     console.log(`历史归档目录: ${dataDir()}${isDataDirPresent() ? '' : '（首次采集时自动创建）'}`);

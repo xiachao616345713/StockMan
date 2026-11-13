@@ -145,10 +145,14 @@ export async function fetchFullSnapshot() {
     for (let pn = 2; pn <= totalPages; pn += 1) {
         pageNumbers.push(pn);
     }
+    /** 失败页号（容忍但须留痕：上游限流时页面成片失败，是「返回空」的直接线索） */
+    const failedPages = [];
     const restPages = await mapWithConcurrency(pageNumbers, 6, async (pn) => {
         try {
             return await fetchClistPage(host, { ...baseParams, pn: String(pn) });
-        } catch {
+        } catch (error) {
+            failedPages.push(pn);
+            console.warn(`[snapshot] 东财第 ${pn}/${totalPages} 页拉取失败（跳过该页）: ${error.message}`);
             return { total: 0, diff: [] }; // 个别页失败容忍，快照仍可用
         }
     });
@@ -157,6 +161,15 @@ export async function fetchFullSnapshot() {
     const stocks = rawItems
         .filter((item) => item && item.f12)
         .map(normalizeStockItem);
+    if (stocks.length === 0) {
+        // 空快照会让下游 screen/search/quote 全部「返回空」：宁可抛错走新浪兜底/回填模型错误
+        throw new Error(`东财快照返回空列表（total=${firstPage.total}，失败页 ${failedPages.length} 个，疑似上游限流）`);
+    }
+    if (failedPages.length > 0) {
+        console.warn(
+            `[snapshot] 东财快照不完整: ${stocks.length}/${firstPage.total} 只（失败 ${failedPages.length} 页: ${failedPages.slice(0, 10).join(',')}${failedPages.length > 10 ? '…' : ''}）`,
+        );
+    }
     return { source: `eastmoney:${host}`, total: firstPage.total, stocks };
 }
 

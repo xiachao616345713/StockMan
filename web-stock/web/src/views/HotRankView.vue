@@ -4,6 +4,7 @@
  * - 平台状态徽章：东财(dfcf) / 同花顺(ths) / 财联社(cls) / 大智慧(dzh)，任一可用即出数据
  * - 按东财名次为主序、同花顺名次为次序排序；缺失名次排末尾
  * - 表头点击可按任一平台名次/涨跌幅排序；行点击跳转个股
+ * - 日期选择（v1.6.0）：历史日期由服务端归档直读（上游无历史热榜接口，归档缺失时如实提示）
  */
 import { ref, computed, onMounted } from 'vue';
 import { apiGet } from '../api.js';
@@ -12,8 +13,20 @@ import { fmtPrice, fmtPct, fmtInt, trendClass } from '../utils/format.js';
 
 const LIMIT_OPTIONS = [50, 100, 300];
 
+/** 本地日期（yyyy-MM-dd）→ 接口日期（yyyyMMdd） */
+const toApiDate = (isoDate) => isoDate.replaceAll('-', '');
+
+const todayIso = () => {
+    const now = new Date();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${now.getFullYear()}-${month}-${day}`;
+};
+
+const queryDate = ref(todayIso());
 const limit = ref(100);
 const hotData = ref(null);
+const meta = ref(null);
 const isLoading = ref(false);
 const errorMessage = ref('');
 
@@ -43,20 +56,38 @@ const loadData = async () => {
     isLoading.value = true;
     errorMessage.value = '';
     try {
-        const resp = await apiGet('/api/hot-rank', { limit: limit.value });
+        const resp = await apiGet('/api/hot-rank', { limit: limit.value, date: toApiDate(queryDate.value) });
         hotData.value = resp.data;
+        meta.value = resp.meta ?? null;
     } catch (error) {
         errorMessage.value = error.message;
         hotData.value = null;
+        meta.value = null;
     } finally {
         isLoading.value = false;
     }
+};
+
+const handleDateChange = () => {
+    loadData();
 };
 
 const handleLimit = (value) => {
     limit.value = value;
     loadData();
 };
+
+/** 归档直读标记（v1.6.0）：历史日期命中服务端归档时展示落盘时间 */
+const archiveInfo = computed(() => {
+    if (meta.value?.fromArchive !== true) {
+        return null;
+    }
+    return {
+        savedAt: meta.value.archiveSavedAt
+            ? new Date(meta.value.archiveSavedAt).toLocaleString('zh-CN', { hour12: false })
+            : null,
+    };
+});
 
 const handleSort = (key) => {
     if (!SORTABLE.includes(key)) {
@@ -117,6 +148,14 @@ onMounted(loadData);
                     >
                         {{ platformLabel(platform.name) }}{{ platform.ok ? ` ✓${platform.count ?? ''}` : ' 不可用' }}
                     </span>
+                    <input
+                        v-model="queryDate"
+                        class="input date-input"
+                        type="date"
+                        :max="todayIso()"
+                        :title="queryDate === todayIso() ? '今天（实时）' : '历史日期由本地归档提供'"
+                        @change="handleDateChange"
+                    >
                     <div class="btn-group">
                         <button
                             v-for="option in LIMIT_OPTIONS"
@@ -139,6 +178,10 @@ onMounted(loadData);
             </div>
 
             <div class="meta-line">
+                <span
+                    v-if="archiveInfo"
+                    class="tag tag-accent"
+                >📦 历史归档{{ archiveInfo.savedAt ? ` · 保存于 ${archiveInfo.savedAt}` : '' }}</span>
                 共合并 {{ total }} 只股票，当前展示 {{ rawList.length }} 只 ·
                 名次为空表示该平台未收录此股
             </div>
@@ -275,6 +318,11 @@ onMounted(loadData);
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+}
+
+.date-input {
+    padding: 6px 10px;
+    color-scheme: dark;
 }
 
 .hot-table-wrap {

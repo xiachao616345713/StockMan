@@ -9,6 +9,10 @@
  * 1. write-through：api.js 各路由成功获取数据后节流落盘（同 key ≥10min 才重写，盘中数据可随采集器刷新）
  * 2. 采集器：index.js 定时调用 api.js#collectHistory（复用路由与缓存，归档当日数据）
  *
+ * 读取路径（v1.6.0 归档直读，见 docs/design.md D19）：
+ * 历史日期（早于上海今天）的 涨停池/连板天梯/龙虎榜/热榜 请求由 api.js#tryArchive 直接读归档，
+ * 命中即零上游请求；未命中回退上游（热榜上游无历史接口，如实 404）。
+ *
  * 注意：热榜/龙虎榜为「抓取时刻」快照；热榜上游不支持按日期回补，归档只能自启用之日起向前累积。
  * 涨停池/龙虎榜支持 date 参数，历史缺口可由 Agent 工具经 invokeRoute 回补（回补同样触发 write-through）。
  */
@@ -87,6 +91,26 @@ export async function loadRecord(type, date8) {
     try {
         const parsed = JSON.parse(await fsp.readFile(fileOf(type, date8), 'utf-8'));
         return parsed?.data ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 读取某日归档（带落盘时间元信息，v1.6.0 归档直读路由用，见 docs/design.md D19）
+ *
+ * @returns {Promise<{data: any, savedAt: string|null}|null>} 不存在或损坏返回 null
+ */
+export async function loadRecordWithMeta(type, date8) {
+    if (!isValidType(type) || !isValidDate8(date8)) {
+        return null;
+    }
+    try {
+        const parsed = JSON.parse(await fsp.readFile(fileOf(type, date8), 'utf-8'));
+        if (!parsed?.data) {
+            return null;
+        }
+        return { data: parsed.data, savedAt: parsed.savedAt ?? null };
     } catch {
         return null;
     }

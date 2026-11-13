@@ -123,15 +123,250 @@ export async function chatCompletions({ messages, tools = null, temperature, max
     } catch (error) {
         throw new LlmError('LLM 响应不是合法 JSON', { cause: error });
     }
-    const message = payload?.choices?.[0]?.message;
+    const choice = payload?.choices?.[0];
+    const message = choice?.message;
     if (!message) {
         throw new LlmError('LLM 响应缺少 choices[0].message（请确认服务为 OpenAI 兼容格式）');
     }
     return {
         role: 'assistant',
         content: message.content ?? '',
+        reasoning: message.reasoning_content ?? null,
+        finishReason: choice.finish_reason ?? null,
         ...(Array.isArray(message.tool_calls) && message.tool_calls.length > 0
             ? { tool_calls: message.tool_calls }
             : {}),
+        usage: normalizeUsage(payload?.usage),
+    };
+}
+
+/** usage 归一化（各厂商字段可能缺失，缺失为 null） */
+function normalizeUsage(usage) {
+    if (!usage || typeof usage !== 'object') {
+        return null;
+    }
+    return {
+        promptTokens: usage.prompt_tokens ?? null,
+        completionTokens: usage.completion_tokens ?? null,
+        totalTokens: usage.total_tokens ?? null,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// 流式调用（SSE，v1.5.0）
+// ---------------------------------------------------------------------------
+
+/**
+ * 流式调用 chat/completions（stream:true），增量回调 + 聚合返回 assistant 消息。
+ *
+ * 增量事件（onDelta 回调）：
+ *   {type: 'reasoning', text}  思考过程增量（DeepSeek reasoning_content 等，逐字推送）
+ *   {type: 'content', text}    正式回答增量
+ *
+ * 聚合逻辑：
+ * - content / reasoning_content 按到达顺序拼接；
+ * - tool_calls 按 delta.index 分组聚合（id/name 取首个非空值，arguments 字符串逐段拼接）；
+ * - usage 取含该字段的 chunk（DeepSeek/OpenAI 在最后一个 chunk 附带）。
+ *
+ * @param {object} options 同 chatCompletions，另加：
+ * @param {(event: {type: 'reasoning'|'content', text: string}) => void} [options.onDelta] 增量回调
+ * @param {AbortSignal} [options.signal] 外部中止信号（客户端断开时中止上游流）
+ * @returns {Promise<{role: 'assistant', content: string, reasoning: string|null, finishReason: string|null, tool_calls?: Array<object>, usage: object|null}>}
+ * @throws {LlmConfigError} 未配置
+ * @throws {LlmError} 调用失败
+ */
+export async function chatCompletionsStream({ messages, tools = null, temperature, maxTokens, timeoutMs, onDelta, signal }) {
+    const config = getLlmConfig();
+    if (!config) {
+        throw new LlmConfigError(
+            'LLM 未配置：请在「设置」页填写模型地址与 Access Token（或设置环境变量 LLM_MODEL_URL / LLM_ACCESS_TOKEN / LLM_MODEL 后重启），详见 README「AI 选股助手」',
+        );
+    }
+    const body = {
+        model: config.model,
+        messages,
+        temperature: temperature ?? config.temperature,
+        max_tokens: maxTokens ?? config.maxTokens,
+        stream: true,
+    };
+    if (tools?.length) {
+        body.tools = tools;
+    }
+
+    // 超时与外部中止合并：任一触发即断开上游流
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs ?? config.timeoutMs);
+    const onOuterAbort = () => controller.abort();
+    if (signal) {
+        if (signal.aborted) {
+            controller.abort();
+        } else {
+            signal.addEventListener('abort', onOuterAbort, { once: true });
+        }
+    }
+
+    let response;
+    try {
+        response = await fetch(completionsUrl(config.modelUrl), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${config.accessToken}`,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+    } catch (error) {
+        const abortedByOuter = signal?.aborted;
+        const reason = abortedByOuter ? '请求已中止' : controller.signal.aborted && !abortedByOuter
+            ? `超时（>${(timeoutMs ?? config.timeoutMs) / 1000}s）`
+            : '网络错误';
+        throw new LlmError(`LLM 服务连接失败（${reason}）: ${config.modelUrl}`, { cause: error });
+    }
+
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onOuterAbort);
+        throw new LlmError(`LLM 服务返回 HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+    if (!response.body) {
+        clearTimeout(timer);
+        throw new LlmError('LLM 服务未返回流式响应体（请确认服务端点支持 stream:true）');
+    }
+
+    let content = '';
+    let reasoning = '';
+    let usage = null;
+    /** 上游截断原因（v1.6.2）：length=token 打满 / content_filter=审查 / stop=正常，空响应排查的关键字段 */
+    let finishReason = null;
+    /** 坏 chunk 统计（v1.6.1）：网关限流页/心跳注释等会解析失败，成片出现即「返回空」的直接线索 */
+    let badChunks = 0;
+    let firstBadChunk = '';
+    /** @type {Map<number, {id: string, name: string, arguments: string}>} 按 delta.index 聚合 */
+    const toolCalls = new Map();
+
+    try {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        const handleChunkJson = (json) => {
+            let chunk;
+            try {
+                chunk = JSON.parse(json);
+            } catch {
+                // 容忍个别坏 chunk（如网关心跳注释行）；数量与首例留日志排查
+                badChunks += 1;
+                if (!firstBadChunk) {
+                    firstBadChunk = json.slice(0, 200);
+                }
+                return;
+            }
+            if (chunk?.usage) {
+                usage = normalizeUsage(chunk.usage);
+            }
+            const choice = chunk?.choices?.[0];
+            // finish_reason 在最后一个 chunk 携带（该 chunk 的 delta 可能为空对象），须在 delta 判断前捕获
+            if (choice?.finish_reason) {
+                finishReason = choice.finish_reason;
+            }
+            const delta = choice?.delta;
+            if (!delta) {
+                return;
+            }
+            if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+                reasoning += delta.reasoning_content;
+                onDelta?.({ type: 'reasoning', text: delta.reasoning_content });
+            }
+            if (typeof delta.content === 'string' && delta.content) {
+                content += delta.content;
+                onDelta?.({ type: 'content', text: delta.content });
+            }
+            if (Array.isArray(delta.tool_calls)) {
+                for (const part of delta.tool_calls) {
+                    const index = Number(part?.index ?? 0);
+                    if (!toolCalls.has(index)) {
+                        toolCalls.set(index, { id: '', name: '', arguments: '' });
+                    }
+                    const acc = toolCalls.get(index);
+                    if (part?.id) {
+                        acc.id = part.id;
+                    }
+                    if (part?.function?.name) {
+                        acc.name += part.function.name;
+                    }
+                    if (typeof part?.function?.arguments === 'string') {
+                        acc.arguments += part.function.arguments;
+                    }
+                }
+            }
+        };
+
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            buffer += decoder.decode(value, { stream: true });
+            // SSE 帧以空行分隔；行内以 'data: ' 前缀携带 JSON
+            let sepIndex;
+            while ((sepIndex = buffer.search(/\r?\n\r?\n/)) !== -1) {
+                const frame = buffer.slice(0, sepIndex);
+                buffer = buffer.slice(sepIndex + buffer.slice(sepIndex).match(/^\r?\n\r?\n/)[0].length);
+                for (const line of frame.split(/\r?\n/)) {
+                    const trimmed = line.replace(/^data:\s?/, '');
+                    if (line.startsWith('data:') && trimmed !== '[DONE]') {
+                        handleChunkJson(trimmed);
+                    }
+                }
+            }
+        }
+        // 流结束：处理 buffer 中可能残留的最后一帧（无结尾空行的服务端）
+        if (buffer.trim()) {
+            for (const line of buffer.split(/\r?\n/)) {
+                const trimmed = line.replace(/^data:\s?/, '');
+                if (line.startsWith('data:') && trimmed !== '[DONE]') {
+                    handleChunkJson(trimmed);
+                }
+            }
+        }
+    } catch (error) {
+        if (signal?.aborted) {
+            throw new LlmError('LLM 流式响应已中止（客户端断开）', { cause: error });
+        }
+        throw new LlmError(`读取 LLM 流式响应失败: ${error.message}`, { cause: error });
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onOuterAbort);
+    }
+
+    const calls = [...toolCalls.values()].filter((call) => call.name || call.arguments);
+    // 空响应日志（v1.6.1）：对话「返回空导致失败」的排查锚点——
+    // content/reasoning/tool_calls/usage 全空通常意味着上游限流、内容审查截断或端点异常
+    if (!content && !reasoning && calls.length === 0 && !usage) {
+        console.warn(
+            `[llm] 流式响应为空（无 content/reasoning/tool_calls/usage）: model=${config.model} url=${completionsUrl(config.modelUrl)}` +
+            ` finish_reason=${finishReason ?? 'null'}` +
+            (badChunks > 0 ? ` | 坏 chunk ${badChunks} 个，首例: ${firstBadChunk}` : ''),
+        );
+    } else if (badChunks > 0) {
+        console.warn(`[llm] 流式响应含 ${badChunks} 个无法解析的 chunk（已跳过），首例: ${firstBadChunk}`);
+    }
+    return {
+        role: 'assistant',
+        content,
+        reasoning: reasoning || null,
+        finishReason,
+        ...(calls.length > 0
+            ? {
+                  tool_calls: calls.map((call, index) => ({
+                      id: call.id || `call_stream_${index}`,
+                      type: 'function',
+                      function: { name: call.name, arguments: call.arguments },
+                  })),
+              }
+            : {}),
+        usage,
     };
 }

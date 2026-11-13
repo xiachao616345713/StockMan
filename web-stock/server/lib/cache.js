@@ -14,7 +14,8 @@ const store = new Map();
  *
  * @template T
  * @param {string} key 缓存键
- * @param {number} ttlMs 存活时间（毫秒）
+ * @param {number | ((value: T) => number)} ttlMs 存活时间（毫秒）；
+ *        传函数则按 producer 结果决定（v1.6.0，如龙虎榜发布前的空列表缩短 TTL）
  * @param {() => Promise<T>} producer 数据生产函数
  * @returns {Promise<{value: T, fromCache: boolean}>}
  */
@@ -33,7 +34,8 @@ export async function cached(key, ttlMs, producer) {
 
     const promise = producer()
         .then((value) => {
-            store.set(key, { expireAt: Date.now() + ttlMs, value, promise: null });
+            const ttl = typeof ttlMs === 'function' ? ttlMs(value) : ttlMs;
+            store.set(key, { expireAt: Date.now() + ttl, value, promise: null });
             return value;
         })
         .catch((error) => {
