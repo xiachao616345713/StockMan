@@ -539,7 +539,11 @@ const routes = {
         return { data: result.value, meta: metaOf(result) };
     },
 
-    /** 板块实时行情（type=industry 行业 / concept 概念） */
+    // ── 已停用（2026-11）：东财 clist 接口 api/qt/clist/get（20/43/52.push2.eastmoney.com）──
+    // 上游返回 Empty reply 无法使用，板块实时行情 / 板块成份股暂无备用数据源，故整体注释。
+    // 恢复方式：待 push2 clist 恢复后取消下方注释即可
+    //（fetchSectors/fetchBkStocks 仍保留于 sources/eastmoney.js，前端「板块排行」Tab 与 Agent get_sectors 工具同步恢复）。
+    /*
     '/api/sectors': async (params) => {
         const type = params.get('type') === 'concept' ? 'concept' : 'industry';
         const result = await cached(`sectors:${type}`, cacheTtl('sectors'), async () => {
@@ -548,7 +552,6 @@ const routes = {
         return { data: result.value.sectors, meta: metaOf(result, { type }) };
     },
 
-    /** 板块成份股实时行情 */
     '/api/sectors/stocks': async (params) => {
         const bk = requireBkCode(params);
         const result = await cached(`bkstocks:${bk}`, cacheTtl('bkstocks'), async () => {
@@ -556,6 +559,7 @@ const routes = {
         });
         return { data: result.value.stocks, meta: metaOf(result, { bk }) };
     },
+    */
 
     /** 涨停池（同花顺；历史日期归档直读，v1.6.0） */
     '/api/limitup/pool': async (params) => {

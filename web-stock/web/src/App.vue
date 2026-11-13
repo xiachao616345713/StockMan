@@ -1,6 +1,7 @@
 <script setup>
 /**
- * App 根组件：顶部导航（AI 助手 / 总览 / 个股查询 / 板块排行 / 涨停中心 / 条件选股 / 龙虎榜 / 热榜）
+ * App 根组件：顶部导航（AI 助手 / 总览 / 个股查询 / 涨停中心 / 条件选股 / 龙虎榜 / 热榜）
+ * 注：「板块排行」已于 2026-11 因东财 clist 接口不可用而隐藏（见下方 TABS 注释）。
  * + 交易状态徽章 + 系统设置齿轮入口（v1.4.0）。
  *
  * 默认标签页为 AI 助手聊天框（v1.3.0，store.js activeTab 初始值 'chat'）。
@@ -13,7 +14,8 @@ import { apiGet } from './api.js';
 import ChatView from './views/ChatView.vue';
 import OverviewView from './views/OverviewView.vue';
 import StockView from './views/StockView.vue';
-import SectorView from './views/SectorView.vue';
+// 已停用（2026-11）：东财 clist 板块接口不可用，板块排行页随之隐藏（详见 server/api.js 同名注释）
+// import SectorView from './views/SectorView.vue';
 import LimitUpView from './views/LimitUpView.vue';
 import ScreenerView from './views/ScreenerView.vue';
 import DragonTigerView from './views/DragonTigerView.vue';
@@ -24,7 +26,8 @@ const TABS = [
     { key: 'chat', label: 'AI 助手', component: ChatView },
     { key: 'overview', label: '总览', component: OverviewView },
     { key: 'stock', label: '个股查询', component: StockView },
-    { key: 'sector', label: '板块排行', component: SectorView },
+    // 已停用（2026-11）：板块排行依赖的东财 clist 接口不可用，隐藏该 Tab（恢复见 server/api.js 注释）
+    // { key: 'sector', label: '板块排行', component: SectorView },
     { key: 'limitup', label: '涨停中心', component: LimitUpView },
     { key: 'screener', label: '条件选股', component: ScreenerView },
     { key: 'dragontiger', label: '龙虎榜', component: DragonTigerView },

@@ -22,7 +22,8 @@ export const TOOL_ROUTES = {
     get_ranking: { path: '/api/ranking', label: '涨跌幅排行' },
     get_hot_rank: { path: '/api/hot-rank', label: '人气热榜' },
     get_limitup_pool: { path: '/api/limitup/pool', label: '涨停池' },
-    get_sectors: { path: '/api/sectors', label: '板块排行' },
+    // 已停用（2026-11）：东财 clist 板块接口不可用（详见 server/api.js 同名注释）
+    // get_sectors: { path: '/api/sectors', label: '板块排行' },
     get_dragon_tiger: { path: '/api/dragon-tiger', label: '龙虎榜' },
 };
 
@@ -167,6 +168,8 @@ const TOOL_DEFS = [
             },
         },
     },
+    // 已停用（2026-11）：东财 clist 板块接口不可用，移除 get_sectors 工具定义（恢复见 server/api.js 注释）
+    /*
     {
         type: 'function',
         function: {
@@ -178,6 +181,7 @@ const TOOL_DEFS = [
             },
         },
     },
+    */
     {
         type: 'function',
         function: {
@@ -338,8 +342,9 @@ function compactToolResult(tool, data) {
                 list: data.list.slice(0, 40).map((s) =>
                     pick(s, ['code', 'name', 'price', 'pct', 'highDays', 'limitUpType', 'reasonType', 'openNum', 'turnover', 'circMv', 'firstLimitUpTime'])),
             };
-        case 'get_sectors':
-            return { list: data.slice(0, 20).map((s) => pick(s, ['code', 'name', 'pct', 'turnover', 'totalMv', 'upCount', 'downCount', 'flatCount'])) };
+        // get_sectors 已停用（2026-11，东财 clist 板块接口不可用）
+        // case 'get_sectors':
+        //     return { list: data.slice(0, 20).map((s) => pick(s, ['code', 'name', 'pct', 'turnover', 'totalMv', 'upCount', 'downCount', 'flatCount'])) };
         case 'get_dragon_tiger':
             return {
                 date: data.date,
@@ -384,8 +389,9 @@ function summarizeTool(tool, payload) {
             return `人气前 ${payload.list?.length ?? 0}`;
         case 'get_limitup_pool':
             return `${payload.total ?? 0} 只涨停`;
-        case 'get_sectors':
-            return `${payload.list?.length ?? 0} 个板块`;
+        // get_sectors 已停用（2026-11，东财 clist 板块接口不可用）
+        // case 'get_sectors':
+        //     return `${payload.list?.length ?? 0} 个板块`;
         case 'get_dragon_tiger':
             return `${payload.total ?? 0} 只上榜`;
         case 'history_overview':
