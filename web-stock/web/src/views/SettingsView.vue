@@ -310,7 +310,7 @@ onUnmounted(() => {
                             class="input num-input"
                             type="number"
                             min="256"
-                            max="32768"
+                            max="300000"
                             step="256"
                         >
                     </label>

@@ -550,7 +550,7 @@ curl http://localhost:8787/api/config
 | `llm.modelUrl` | 空串或合法 http(s) 地址 |
 | `llm.timeoutMs` | 整数 5000–600000 |
 | `llm.temperature` | 数字 0–2 |
-| `llm.maxTokens` | 整数 256–32768 |
+| `llm.maxTokens` | 整数 256–300000 |
 | `agent.maxRounds` | 整数 1–20 |
 | `agent.maxMessages` | 整数 1–200 |
 | `agent.maxContent` | 整数 100–100000 |
